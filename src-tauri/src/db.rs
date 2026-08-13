@@ -79,10 +79,12 @@ impl Database {
             "INSERT OR REPLACE INTO command_log(id,host_id,timestamp,data) VALUES(?1,?2,?3,?4)",
             params![record.id, record.host_id, record.timestamp, data],
         )?;
-        connection.execute(
-            "DELETE FROM command_log WHERE timestamp < datetime('now','-7 days')",
-            [],
-        )?;
+        let retention_days: i64 = connection.query_row("SELECT COALESCE(json_extract(value, '$.commandRetentionDays'), 7) FROM settings WHERE key='app'", [], |row| row.get(0)).unwrap_or(7);
+        connection.execute("DELETE FROM command_log WHERE timestamp < datetime('now', '-' || ?1 || ' days')", [retention_days])?;
+        let retention_mb: i64 = connection.query_row("SELECT COALESCE(json_extract(value, '$.commandRetentionMb'), 100) FROM settings WHERE key='app'", [], |row| row.get(0)).unwrap_or(100);
+        while connection.query_row::<i64, _, _>("SELECT COALESCE(SUM(length(data)),0) FROM command_log", [], |row| row.get(0)).unwrap_or(0) > retention_mb * 1024 * 1024 {
+            connection.execute("DELETE FROM command_log WHERE id=(SELECT id FROM command_log ORDER BY timestamp ASC LIMIT 1)", [])?;
+        }
         Ok(())
     }
     pub fn commands(&self, host_id: Option<&str>) -> AppResult<Vec<CommandRecord>> {
@@ -96,6 +98,17 @@ impl Database {
         }
         result.reverse();
         Ok(result)
+    }
+    pub fn command_clear(&self) -> AppResult<()> {
+        self.0.lock().execute("DELETE FROM command_log", [])?;
+        Ok(())
+    }
+    pub fn setting_get(&self, key: &str) -> AppResult<Option<String>> {
+        Ok(self.0.lock().query_row("SELECT value FROM settings WHERE key=?1", [key], |r| r.get(0)).optional()?)
+    }
+    pub fn setting_set(&self, key: &str, value: &str) -> AppResult<()> {
+        self.0.lock().execute("INSERT INTO settings(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value", params![key, value])?;
+        Ok(())
     }
     pub fn metric_add(&self, metric: &MetricSnapshot, resolution: u32) -> AppResult<()> {
         let data = serde_json::to_string(metric).map_err(|e| AppError::Other(e.to_string()))?;

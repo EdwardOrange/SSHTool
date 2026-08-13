@@ -51,6 +51,34 @@ pub struct HostDraft {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct CommandSuppressionRule {
+    pub id: String,
+    pub enabled: bool,
+    pub source: Option<String>,
+    pub host_id: Option<String>,
+    pub contains: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppSettings {
+    pub version: u32,
+    pub locale: String,
+    pub theme: String,
+    pub default_page: String,
+    pub terminal_font_size: u32,
+    pub terminal_scrollback: u32,
+    pub terminal_paste_protection: bool,
+    pub terminal_command_logging: bool,
+    pub monitor_interval_seconds: u32,
+    pub transfer_conflict_policy: String,
+    pub command_retention_days: u32,
+    pub command_retention_mb: u32,
+    pub suppression_rules: Vec<CommandSuppressionRule>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct NetworkConnection {
     pub protocol: String,
     pub state: String,
@@ -191,6 +219,7 @@ pub struct CommandRecord {
     pub status: String,
     pub repeat_count: u32,
     pub equivalent: Option<bool>,
+    pub operation_kind: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

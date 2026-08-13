@@ -13,7 +13,7 @@ use firewall::FirewallManager;
 use models::*;
 use monitor::MonitorManager;
 use parking_lot::Mutex;
-use ssh::SshManager;
+use ssh::{SshManager, TerminalAuditEvent};
 use std::{
     path::PathBuf,
     sync::{
@@ -34,17 +34,19 @@ struct AppState {
 }
 
 fn emit_command(state: &AppState, record: CommandRecord) {
-    if state.db.command_add(&record).is_err() {
-        return;
-    }
+    persist_and_emit_command(&state.db, &state.command_channels, &state.command_sequence, record);
+}
+
+fn persist_and_emit_command(db: &Database, channels: &Mutex<Vec<Channel<StreamEnvelope<CommandRecord>>>>, sequence: &AtomicU64, record: CommandRecord) {
+    if db.command_add(&record).is_err() { return; }
     let envelope = StreamEnvelope {
-        seq: state.command_sequence.fetch_add(1, Ordering::Relaxed),
+        seq: sequence.fetch_add(1, Ordering::Relaxed),
         timestamp: record.timestamp.clone(),
         host_id: record.host_id.clone().unwrap_or_default(),
         session_id: None,
         payload: record,
     };
-    let mut channels = state.command_channels.lock();
+    let mut channels = channels.lock();
     channels.retain(|channel| channel.send(envelope.clone()).is_ok());
 }
 
@@ -77,6 +79,7 @@ fn operation_record(
             status: status.into(),
             repeat_count: 1,
             equivalent: Some(true),
+            operation_kind: Some(source.into()),
         },
     );
 }
@@ -208,6 +211,7 @@ async fn ssh_connect(
         },
         repeat_count: 1,
         equivalent: Some(true),
+        operation_kind: Some("connection".into()),
     };
     emit_command(&state, record);
     result
@@ -225,8 +229,23 @@ async fn terminal_open(
     cols: u32,
     rows: u32,
     channel: Channel<StreamEnvelope<Vec<u8>>>,
+    command_logging: Option<bool>,
 ) -> AppResult<String> {
-    state.ssh.terminal_open(&host_id, cols, rows, channel).await
+    let (audit_sender, mut audit_receiver) = tokio::sync::mpsc::unbounded_channel::<TerminalAuditEvent>();
+    let session_id = state.ssh.terminal_open(&host_id, cols, rows, channel, command_logging.unwrap_or(true), audit_sender).await?;
+    let db = state.db.clone();
+    let command_channels = state.command_channels.clone();
+    let command_sequence = state.command_sequence.clone();
+    tokio::spawn(async move {
+        while let Some(event) = audit_receiver.recv().await {
+            let command = security::redact(&event.command);
+            if command.trim().is_empty() { continue; }
+            let host_name = db.host_get(&event.host_id).ok().map(|host| host.name);
+            let record = CommandRecord { id: Uuid::new_v4().to_string(), timestamp: event.timestamp, host_id: Some(event.host_id), host_name, source: "terminal".into(), command, stdout: String::new(), stderr: String::new(), exit_code: Some(event.exit_code), duration_ms: 0, status: if event.exit_code == 0 { "success".into() } else { "error".into() }, repeat_count: 1, equivalent: None, operation_kind: Some("terminal.shell".into()) };
+            persist_and_emit_command(&db, &command_channels, &command_sequence, record);
+        }
+    });
+    Ok(session_id)
 }
 #[tauri::command]
 async fn terminal_input(
@@ -344,8 +363,9 @@ fn command_log_export(
     state: State<'_, AppState>,
     path: PathBuf,
     host_id: Option<String>,
+    records: Option<Vec<CommandRecord>>,
 ) -> AppResult<()> {
-    let records = state.db.commands(host_id.as_deref())?;
+    let records = match records { Some(records) => records, None => state.db.commands(host_id.as_deref())? };
     let text = records
         .into_iter()
         .map(|r| {
@@ -362,6 +382,35 @@ fn command_log_export(
         .join("\n");
     std::fs::write(path, text)?;
     Ok(())
+}
+
+#[tauri::command]
+fn command_log_clear(state: State<'_, AppState>) -> AppResult<()> {
+    state.db.command_clear()
+}
+
+fn default_settings() -> AppSettings {
+    AppSettings { version: 1, locale: "zh".into(), theme: "system".into(), default_page: "monitor".into(), terminal_font_size: 13, terminal_scrollback: 10000, terminal_paste_protection: true, terminal_command_logging: true, monitor_interval_seconds: 2, transfer_conflict_policy: "ask".into(), command_retention_days: 7, command_retention_mb: 100, suppression_rules: vec![CommandSuppressionRule { id: "monitor-sample".into(), enabled: true, source: Some("monitor".into()), host_id: None, contains: Some("cat /proc/stat".into()) }] }
+}
+
+#[tauri::command]
+fn settings_get(state: State<'_, AppState>) -> AppResult<AppSettings> {
+    Ok(state.db.setting_get("app")?.and_then(|v| serde_json::from_str(&v).ok()).unwrap_or_else(default_settings))
+}
+
+#[tauri::command]
+fn settings_update(state: State<'_, AppState>, settings: AppSettings) -> AppResult<AppSettings> {
+    let value = serde_json::to_string(&settings).map_err(|e| AppError::Other(e.to_string()))?;
+    state.db.setting_set("app", &value)?;
+    Ok(settings)
+}
+
+#[tauri::command]
+fn settings_reset(state: State<'_, AppState>) -> AppResult<AppSettings> {
+    let settings = default_settings();
+    let value = serde_json::to_string(&settings).map_err(|e| AppError::Other(e.to_string()))?;
+    state.db.setting_set("app", &value)?;
+    Ok(settings)
 }
 
 #[allow(unreachable_code)]
@@ -387,6 +436,7 @@ async fn sftp_list(
         status: "success".into(),
         repeat_count: 1,
         equivalent: Some(true),
+        operation_kind: Some("sftp.list".into()),
     });
     return Ok(entries);
 
@@ -437,6 +487,7 @@ async fn sftp_list(
         status: "success".into(),
         repeat_count: 1,
         equivalent: Some(true),
+        operation_kind: Some("sftp.list".into()),
     });
     Ok(entries)
 }
@@ -483,6 +534,29 @@ async fn sftp_start_download(
     channel: Channel<StreamEnvelope<TransferProgress>>,
 ) -> AppResult<String> {
     sftp_download(state, host_id, remote_paths, local_directory, channel).await
+}
+
+#[tauri::command]
+async fn sftp_delete(state: State<'_, AppState>, host_id: String, paths: Vec<String>) -> AppResult<()> {
+    state.ssh.sftp_delete(&host_id, &paths).await?;
+    operation_record(&state, Some(host_id), "sftp", format!("sftp> rm {}", paths.join(" ")), "success", String::new(), String::new());
+    Ok(())
+}
+#[tauri::command]
+async fn sftp_rename(state: State<'_, AppState>, host_id: String, path: String, new_path: String) -> AppResult<()> {
+    state.ssh.sftp_rename(&host_id, &path, &new_path).await?;
+    operation_record(&state, Some(host_id), "sftp", format!("sftp> rename {} {}", path, new_path), "success", String::new(), String::new());
+    Ok(())
+}
+#[tauri::command]
+async fn sftp_mkdir(state: State<'_, AppState>, host_id: String, path: String) -> AppResult<()> {
+    state.ssh.sftp_mkdir(&host_id, &path).await?;
+    operation_record(&state, Some(host_id), "sftp", format!("sftp> mkdir {}", path), "success", String::new(), String::new());
+    Ok(())
+}
+#[tauri::command]
+async fn sftp_start_copy(state: State<'_, AppState>, host_id: String, sources: Vec<String>, destination_directory: String, channel: Channel<StreamEnvelope<TransferProgress>>) -> AppResult<String> {
+    state.ssh.sftp_copy(&host_id, sources, destination_directory, channel).await
 }
 
 #[tauri::command]
@@ -681,12 +755,20 @@ pub fn run() {
             command_log_query,
             command_log_subscribe,
             command_log_export,
+            command_log_clear,
+            settings_get,
+            settings_update,
+            settings_reset,
             sftp_list,
             sftp_upload,
             sftp_start_upload,
             sftp_download,
             sftp_start_download,
             sftp_cancel,
+            sftp_delete,
+            sftp_rename,
+            sftp_mkdir,
+            sftp_start_copy,
             forward_list,
             forward_upsert,
             forward_start,

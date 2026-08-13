@@ -154,6 +154,31 @@ export interface CommandRecord {
   status: "running" | "success" | "error" | "cancelled";
   repeatCount: number;
   equivalent?: boolean;
+  operationKind?: string;
+}
+
+export interface CommandSuppressionRule {
+  id: string;
+  enabled: boolean;
+  source?: CommandRecord["source"];
+  hostId?: string;
+  contains?: string;
+}
+
+export interface AppSettings {
+  version: number;
+  locale: "zh" | "en";
+  theme: "system" | "light" | "dark";
+  defaultPage: PageId;
+  terminalFontSize: number;
+  terminalScrollback: number;
+  terminalPasteProtection: boolean;
+  terminalCommandLogging: boolean;
+  monitorIntervalSeconds: 2 | 5 | 10 | 30;
+  transferConflictPolicy: "ask" | "overwrite" | "skip" | "rename" | "resume";
+  commandRetentionDays: number;
+  commandRetentionMb: number;
+  suppressionRules: CommandSuppressionRule[];
 }
 
 export interface SftpEntry {

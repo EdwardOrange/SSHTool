@@ -13,7 +13,6 @@ use uuid::Uuid;
 #[derive(Clone)]
 struct StoredPlan {
     plan: FirewallPlan,
-    change: FirewallChange,
     backend: String,
     applied: bool,
     rollback_unit: Option<String>,
@@ -35,7 +34,7 @@ impl FirewallManager {
     }
 
     pub async fn read(&self, ssh: &SshManager, host_id: &str) -> AppResult<FirewallState> {
-        let detect = "LANG=C sh -c 'if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q Status; then echo ufw; sudo -n ufw status verbose 2>/dev/null || ufw status verbose; elif command -v firewall-cmd >/dev/null && firewall-cmd --state >/dev/null 2>&1; then echo firewalld; sudo -n firewall-cmd --list-all --zone=$(firewall-cmd --get-default-zone); elif command -v nft >/dev/null; then echo nftables; sudo -n nft list ruleset 2>/dev/null || nft list ruleset; else echo unsupported; fi; echo __ROLLBACK__; if command -v systemd-run >/dev/null || command -v at >/dev/null; then echo yes; else echo no; fi'";
+        let detect = "LANG=C sh -c 'if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q Status; then echo ufw; echo __UFW_VERBOSE__; sudo -n ufw status verbose 2>/dev/null || ufw status verbose; echo __UFW_NUMBERED__; sudo -n ufw status numbered 2>/dev/null || ufw status numbered; elif command -v firewall-cmd >/dev/null && firewall-cmd --state >/dev/null 2>&1; then echo firewalld; sudo -n firewall-cmd --list-all --zone=$(firewall-cmd --get-default-zone); elif command -v nft >/dev/null; then echo nftables; sudo -n nft list ruleset 2>/dev/null || nft list ruleset; else echo unsupported; fi; echo __ROLLBACK__; if command -v systemd-run >/dev/null || command -v at >/dev/null; then echo yes; else echo no; fi'";
         let out = ssh.exec(host_id, detect).await?;
         let before = out.stdout.split("__ROLLBACK__").next().unwrap_or("");
         let rollback = out
@@ -76,12 +75,14 @@ impl FirewallManager {
         host_id: &str,
         change: FirewallChange,
     ) -> AppResult<FirewallPlan> {
+        if change.operation != "add" && change.operation != "delete" { return Err(AppError::Validation("防火墙操作必须是 add 或 delete".into())); }
         validate_rule(&change.rule)?;
         let mut rule = change.rule.clone();
+        if change.operation == "delete" && rule.id.is_none() { return Err(AppError::Validation("删除规则必须提供 id".into())); }
         if rule.id.is_none() {
             rule.id = Some(Uuid::new_v4().to_string());
         }
-        let change = FirewallChange {
+        let mut change = FirewallChange {
             operation: change.operation,
             rule,
         };
@@ -93,6 +94,15 @@ impl FirewallManager {
         }
         if state.backend == "unsupported" {
             return Err(AppError::Validation("没有检测到受支持的防火墙".into()));
+        }
+        if change.operation == "delete" {
+            let current = state.rules.iter().find(|item| Some(&item.id) == change.rule.id.as_ref()).ok_or(AppError::StalePlan)?;
+            if !delete_target_matches(&change.rule, current) {
+                return Err(AppError::StalePlan);
+            }
+            if current.read_only.unwrap_or(false) { return Err(AppError::Permission("该防火墙规则为只读，无法安全删除".into())); }
+            if state.backend == "ufw" && !current.backend_ref.as_deref().map(|value| value.chars().all(|c| c.is_ascii_digit())).unwrap_or(false) { return Err(AppError::Validation("UFW 规则缺少可靠编号，请刷新规则后重试".into())); }
+            change.rule = FirewallRuleInput { id: Some(current.id.clone()), backend_ref: current.backend_ref.clone(), direction: current.direction.clone(), family: current.family.clone(), protocol: current.protocol.clone(), ports: current.ports.clone(), source: current.source.clone(), destination: current.destination.clone(), action: current.action.clone(), enabled: current.enabled, comment: current.comment.clone(), zone: current.zone.clone(), read_only: current.read_only };
         }
         let command = command_for(&state.backend, &change)?;
         let id = Uuid::new_v4().to_string();
@@ -106,11 +116,16 @@ impl FirewallManager {
             host_id: host_id.into(),
             state_hash: state.state_hash,
             summary: format!(
-                "{} {} {} {}",
-                if change.operation == "add" {
-                    "添加"
+                "{}{} {} {} {}",
+                match change.operation.as_str() {
+                    "add" => "添加",
+                    "delete" => "删除",
+                    _ => "修改",
+                },
+                if change.operation == "delete" {
+                    change.rule.backend_ref.as_deref().map(|reference| format!(" #{reference}")).unwrap_or_default()
                 } else {
-                    "修改"
+                    String::new()
                 },
                 change.rule.action.to_uppercase(),
                 change.rule.protocol.to_uppercase(),
@@ -129,7 +144,6 @@ impl FirewallManager {
             id,
             StoredPlan {
                 plan: plan.clone(),
-                change,
                 backend: state.backend,
                 applied: false,
                 rollback_unit: None,
@@ -183,10 +197,11 @@ impl FirewallManager {
             if sudo_password.is_none() && (output.stderr.to_lowercase().contains("sudo") || output.stderr.to_lowercase().contains("password")) {
                 return Err(AppError::SudoRequired);
             }
-            return Err(AppError::Permission(format!(
-                "防火墙命令失败：{}",
-                output.stderr
-            )));
+            let rollback_command = format!("sudo -n systemctl start {unit}.service");
+            let rollback_elevated = if sudo_password.is_some() { rollback_command.replace("sudo -n", "sudo -S -p ''") } else { rollback_command };
+            let rollback_result = ssh.exec_with_input(&stored.plan.host_id, &rollback_elevated, sudo_password).await;
+            let rollback_message = match rollback_result { Ok(result) if result.exit_code == 0 => "自动回滚已启动".to_string(), Ok(result) => format!("自动回滚失败：{}", meaningful_firewall_error(&result.stdout, &result.stderr)), Err(error) => format!("自动回滚失败：{error}") };
+            return Err(AppError::Permission(format!("防火墙命令失败：{}；{}", meaningful_firewall_error(&output.stdout, &output.stderr), rollback_message)));
         }
         ssh.exec(&stored.plan.host_id, "true").await?;
         if let Some(p) = self.plans.write().get_mut(plan_id) {
@@ -229,9 +244,29 @@ impl FirewallManager {
         Ok(())
     }
 }
+fn meaningful_firewall_error(stdout: &str, stderr: &str) -> String {
+    let lines = stderr.lines().chain(stdout.lines()).filter(|line| {
+        let line = line.trim();
+        !line.is_empty() && !line.starts_with("Running timer as unit:") && !line.starts_with("Will run service as unit:")
+    }).collect::<Vec<_>>();
+    if lines.is_empty() { "未知错误".into() } else { lines.join("\n") }
+}
+
 fn quality(s: &str) -> String {
     s.into()
 }
+
+fn delete_target_matches(input: &FirewallRuleInput, current: &UnifiedFirewallRule) -> bool {
+    input.backend_ref == current.backend_ref
+        && input.direction == current.direction
+        && input.family == current.family
+        && input.protocol == current.protocol
+        && input.ports == current.ports
+        && input.source == current.source
+        && input.destination == current.destination
+        && input.action == current.action
+}
+
 fn validate_rule(r: &FirewallRuleInput) -> AppResult<()> {
     if !["tcp", "udp", "icmp", "any"].contains(&r.protocol.as_str()) {
         return Err(AppError::Validation("协议无效".into()));
@@ -262,34 +297,42 @@ fn command_for(backend: &str, c: &FirewallChange) -> AppResult<String> {
     let comment = shell_quote(&r.comment)?;
     let source = if r.source == "any" { "any" } else { &r.source };
     let port = if r.ports.is_empty() { "any" } else { &r.ports };
-    let operation = if c.operation == "add" { r.action.as_str() } else { "delete" };
+    let operation = c.operation.as_str();
     Ok(match backend {
         "ufw" => {
+            if operation == "delete" {
+                let number = r.backend_ref.as_deref().filter(|value| !value.is_empty() && value.chars().all(|c| c.is_ascii_digit())).ok_or_else(|| AppError::Validation("UFW 规则缺少可靠编号".into()))?;
+                return Ok(format!("ufw --force delete {number}"));
+            }
             let proto = if r.protocol == "any" { String::new() } else { format!(" proto {}", r.protocol) };
             let from = if source == "any" { String::new() } else { format!(" from {}", source) };
             let port_clause = if port == "any" { String::new() } else { format!(" to any port {}", port) };
-            format!("ufw {}{}{}{} comment {}", operation, proto, from, port_clause, comment)
+            format!("ufw {}{}{}{} comment {}", r.action, proto, from, port_clause, comment)
         }
         "firewalld" => {
             let source_clause = if source == "any" { String::new() } else { format!(" source address=\"{}\"", source) };
             let port_clause = if port == "any" { String::new() } else { format!(" port port=\"{}\" protocol=\"{}\"", port, r.protocol) };
             let verb = if r.action == "allow" { "accept" } else { "drop" };
-            format!("firewall-cmd --zone={} --add-rich-rule={}", r.zone.as_deref().unwrap_or("public"), shell_quote(&format!("rule family=\"{}\"{}{} {}", if r.family == "ipv6" { "ipv6" } else { "ipv4" }, source_clause, port_clause, verb))?)
+            let rich = shell_quote(&format!("rule family=\"{}\"{}{} {}", if r.family == "ipv6" { "ipv6" } else { "ipv4" }, source_clause, port_clause, verb))?;
+            format!("firewall-cmd --zone={} --{}rich-rule={}", r.zone.as_deref().unwrap_or("public"), if operation == "add" { "add-" } else { "remove-" }, rich)
         }
         "nftables" => {
             let family = if r.family == "ipv6" { "ip6" } else { "ip" };
             let source_clause = if source == "any" { String::new() } else { format!(" saddr {}", source) };
             let port_clause = if port == "any" || r.protocol == "icmp" || r.protocol == "any" { String::new() } else { format!(" dport {}", port) };
+            if operation != "add" { return Err(AppError::Validation("nftables 规则没有可靠的 handle，无法安全删除".into())); }
             format!("nft add rule inet filter input {}{}{} {} comment {}", family, source_clause, port_clause, if r.action == "allow" { "accept" } else { "drop" }, comment)
         }
         _ => return Err(AppError::Validation("不支持的防火墙".into())),
     })
 }
 fn parse_ufw(raw: &str) -> (bool, String, String, Vec<UnifiedFirewallRule>) {
-    let enabled = raw.contains("Status: active");
+    let verbose = raw.split("__UFW_VERBOSE__").nth(1).unwrap_or(raw).split("__UFW_NUMBERED__").next().unwrap_or("");
+    let numbered = raw.split("__UFW_NUMBERED__").nth(1).unwrap_or(raw);
+    let enabled = verbose.contains("Status: active") || numbered.contains("Status: active");
     let mut di = "deny".into();
     let mut dout = "allow".into();
-    for l in raw.lines() {
+    for l in verbose.lines() {
         if l.starts_with("Default:") {
             let low = l.to_lowercase();
             if low.contains("allow (incoming)") {
@@ -300,44 +343,30 @@ fn parse_ufw(raw: &str) -> (bool, String, String, Vec<UnifiedFirewallRule>) {
             }
         }
     }
-    let mut rules = Vec::new();
-    for (i, l) in raw.lines().enumerate() {
-        if !(l.contains("ALLOW") || l.contains("DENY") || l.contains("REJECT")) {
-            continue;
-        }
-        let p: Vec<&str> = l.split_whitespace().collect();
-        if p.len() < 3 {
-            continue;
-        }
-        let action = if l.contains("ALLOW") {
-            "allow"
-        } else if l.contains("REJECT") {
-            "reject"
-        } else {
-            "deny"
-        };
-        let proto = if p[0].contains("/udp") { "udp" } else { "tcp" };
-        rules.push(UnifiedFirewallRule {
-            id: format!("ufw-{i}"),
-            backend_ref: None,
-            direction: "in".into(),
-            family: if l.contains("(v6)") {
-                "ipv6".into()
-            } else {
-                "ipv4".into()
-            },
-            protocol: proto.into(),
-            ports: p[0].split('/').next().unwrap_or("any").into(),
-            source: p.last().unwrap_or(&"any").to_string(),
-            destination: "any".into(),
-            action: action.into(),
-            enabled: true,
-            comment: l.split('#').nth(1).unwrap_or("").trim().into(),
-            zone: None,
-            read_only: None,
-        });
-    }
+    let rules = numbered.lines().filter_map(parse_ufw_numbered_line).collect();
     (enabled, di, dout, rules)
+}
+
+fn parse_ufw_numbered_line(line: &str) -> Option<UnifiedFirewallRule> {
+    let trimmed = line.trim();
+    if !trimmed.starts_with('[') { return None; }
+    let close = trimmed.find(']')?;
+    let number = trimmed[1..close].trim();
+    if number.is_empty() || !number.chars().all(|c| c.is_ascii_digit()) { return None; }
+    let rest = trimmed[close + 1..].trim();
+    let (body, comment) = rest.split_once('#').map(|(body, comment)| (body.trim(), comment.trim())).unwrap_or((rest, ""));
+    let tokens = body.split_whitespace().collect::<Vec<_>>();
+    let action_index = tokens.iter().position(|value| matches!(*value, "ALLOW" | "DENY" | "REJECT"))?;
+    if action_index == 0 { return None; }
+    let destination_token = tokens[0];
+    let direction = tokens.get(action_index + 1).copied().filter(|value| matches!(*value, "IN" | "OUT")).unwrap_or("IN");
+    let source = tokens.iter().skip(action_index + 2).filter(|value| **value != "(v6)").copied().collect::<Vec<_>>().join(" ");
+    let family = if body.contains("(v6)") { "ipv6" } else { "ipv4" };
+    let protocol = if destination_token.ends_with("/udp") { "udp" } else if destination_token.ends_with("/tcp") { "tcp" } else { "any" };
+    let destination = destination_token.split('/').next().unwrap_or("Anywhere");
+    Some(UnifiedFirewallRule {
+        id: format!("ufw-{number}"), backend_ref: Some(number.into()), direction: if direction == "OUT" { "out".into() } else { "in".into() }, family: family.into(), protocol: protocol.into(), ports: if destination.eq_ignore_ascii_case("Anywhere") { "any".into() } else { destination.into() }, source: if source.is_empty() || source.eq_ignore_ascii_case("Anywhere") { "any".into() } else { source }, destination: "any".into(), action: tokens[action_index].to_ascii_lowercase(), enabled: true, comment: comment.into(), zone: None, read_only: None,
+    })
 }
 fn parse_firewalld(raw: &str) -> (bool, String, String, Vec<UnifiedFirewallRule>) {
     let mut rules = Vec::new();
@@ -413,6 +442,7 @@ fn log(
         },
         repeat_count: 1,
         equivalent: None,
+        operation_kind: Some(source.into()),
     });
 }
 
@@ -454,5 +484,36 @@ mod tests {
         .unwrap();
         assert!(c.contains("ufw allow"));
         assert!(!c.contains("ufw add"));
+    }
+    #[test]
+    fn parses_numbered_ufw_rules_without_treating_comments_as_sources() {
+        let raw = "__UFW_VERBOSE__\nStatus: active\nDefault: deny (incoming), allow (outgoing)\n__UFW_NUMBERED__\nStatus: active\n[ 1] 22/tcp ALLOW IN 10.0.0.0/8 # SSH office\n[ 2] 443/tcp (v6) ALLOW IN Anywhere (v6) # Web v6";
+        let (_, _, _, rules) = parse_ufw(raw);
+        assert_eq!(rules.len(), 2);
+        assert_eq!(rules[0].backend_ref.as_deref(), Some("1"));
+        assert_eq!(rules[0].source, "10.0.0.0/8");
+        assert_eq!(rules[0].comment, "SSH office");
+        assert_eq!(rules[1].source, "any");
+        assert_eq!(rules[1].family, "ipv6");
+    }
+    #[test]
+    fn deletes_ufw_by_stable_number() {
+        let mut r = rule(); r.backend_ref = Some("12".into());
+        let command = command_for("ufw", &FirewallChange { operation: "delete".into(), rule: r }).unwrap();
+        assert_eq!(command, "ufw --force delete 12");
+    }
+    #[test]
+    fn refuses_a_number_that_now_points_to_a_different_rule() {
+        let mut input = rule();
+        input.backend_ref = Some("1".into());
+        let current = UnifiedFirewallRule {
+            id: "ufw-1".into(), backend_ref: Some("1".into()), direction: "in".into(), family: "ipv4".into(), protocol: "tcp".into(), ports: "443".into(), source: "any".into(), destination: "any".into(), action: "allow".into(), enabled: true, comment: String::new(), zone: None, read_only: None,
+        };
+        assert!(!delete_target_matches(&input, &current));
+    }
+    #[test]
+    fn hides_systemd_run_noise_from_firewall_errors() {
+        let message = meaningful_firewall_error("", "Running timer as unit: x.timer\nWill run service as unit: x.service\nERROR: Bad source address");
+        assert_eq!(message, "ERROR: Bad source address");
     }
 }

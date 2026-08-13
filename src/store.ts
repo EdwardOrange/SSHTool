@@ -1,5 +1,5 @@
 import { create } from "zustand";
-import type { CommandRecord, FirewallState, HostProfile, MetricSnapshot, PageId, TransferProgress } from "./types";
+import type { AppSettings, CommandRecord, FirewallState, HostProfile, MetricSnapshot, PageId, TransferProgress } from "./types";
 
 export interface TransferTaskView {
   progress: TransferProgress;
@@ -18,6 +18,7 @@ interface AppState {
   commandPanelOpen: boolean;
   commandPanelHeight: number;
   transfers: Record<string, TransferTaskView>;
+  settings: AppSettings | undefined;
   setHosts: (hosts: HostProfile[]) => void;
   upsertHost: (host: HostProfile) => void;
   selectHost: (id?: string) => void;
@@ -30,10 +31,11 @@ interface AppState {
   setCommandPanelHeight: (height: number) => void;
   upsertTransfer: (progress: TransferProgress) => void;
   clearCompletedTransfers: () => void;
+  setSettings: (settings: AppSettings) => void;
 }
 
 export const useAppStore = create<AppState>((set) => ({
-  hosts: [], page: "monitor", metrics: {}, firewall: {}, commands: [], commandPanelOpen: true, commandPanelHeight: 216, transfers: {},
+  hosts: [], page: "monitor", metrics: {}, firewall: {}, commands: [], commandPanelOpen: true, commandPanelHeight: 216, transfers: {}, settings: undefined,
   setHosts: (hosts) => set({ hosts: hosts.map(normalizeHost), selectedHostId: hosts[0]?.id }),
   upsertHost: (host) => set((s) => {
     const normalized = normalizeHost(host);
@@ -59,6 +61,7 @@ export const useAppStore = create<AppState>((set) => ({
     return { transfers: { ...s.transfers, [normalized.transferId]: { progress: normalized, startedAt: previous?.startedAt || now, updatedAt: now, speed } } };
   }),
   clearCompletedTransfers: () => set((s) => ({ transfers: Object.fromEntries(Object.entries(s.transfers).filter(([, task]) => !["completed", "error", "cancelled"].includes(task.progress.status))) })),
+  setSettings: (settings) => set({ settings }),
 }));
 
 function normalizeHost(host: HostProfile): HostProfile {
