@@ -1,0 +1,1 @@
+{"main-capability":{"identifier":"main-capability","description":"Only capabilities required by the main local application window.","local":true,"windows":["main"],"permissions":["core:default","dialog:allow-open","dialog:allow-save","fs:allow-read-file","fs:allow-write-file","opener:allow-open-url"]}}

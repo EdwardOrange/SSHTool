@@ -1,0 +1,37 @@
+import { Brightness4Rounded, Brightness7Rounded, Circle, CloudOffRounded, LanguageRounded, MoreVertRounded, SettingsRounded, TerminalRounded } from "@mui/icons-material";
+import { AppBar, Box, Button, CircularProgress, Divider, IconButton, Menu, MenuItem, Stack, Tab, Tabs, Toolbar, Tooltip, Typography } from "@mui/material";
+import React from "react";
+import { useTranslation } from "react-i18next";
+import { api } from "./api";
+import CommandLedger from "./components/CommandLedger";
+import FirewallView from "./components/FirewallView";
+import ForwardingView from "./components/ForwardingView";
+import HostDialog from "./components/HostDialog";
+import MonitorView from "./components/MonitorView";
+import ServerSidebar from "./components/ServerSidebar";
+import SftpView from "./components/SftpView";
+import TerminalView from "./components/TerminalView";
+import TransferDrawer from "./components/TransferDrawer";
+import { useAppStore } from "./store";
+import type { PageId } from "./types";
+
+const pages: { id: PageId; label: string }[] = [{ id: "terminal", label: "terminal" }, { id: "monitor", label: "monitor" }, { id: "firewall", label: "firewall" }, { id: "sftp", label: "sftp" }, { id: "forwarding", label: "forwarding" }];
+
+export default function App({ mode, toggleMode }: { mode: "light" | "dark"; toggleMode: () => void }) {
+  const { t, i18n } = useTranslation(); const { hosts, setHosts, selectedHostId, page, setPage, upsertHost, setCommands, addCommand } = useAppStore();
+  const [loading, setLoading] = React.useState(true); const [startupError, setStartupError] = React.useState(""); const [hostDialog, setHostDialog] = React.useState(false); const [connecting, setConnecting] = React.useState(false); const [menuEl, setMenuEl] = React.useState<HTMLElement | null>(null);
+  const host = hosts.find((h) => h.id === selectedHostId);
+  React.useEffect(() => { let alive = true; setLoading(true); setStartupError(""); Promise.all([api.hostsList(), api.commandLogQuery()]).then(([list, commands]) => { if (!alive) return; setHosts(list); setCommands(commands); }).then(() => api.commandLogSubscribe((event) => alive && addCommand(event.payload))).catch((e) => { if (alive) setStartupError(String(e)); }).finally(() => { if (alive) setLoading(false); }); const timer = window.setInterval(() => { if (alive) api.commandLogQuery().then(setCommands).catch(() => undefined); }, 1500); return () => { alive = false; window.clearInterval(timer); }; }, [setHosts, setCommands, addCommand]);
+  const toggleConnection = async () => { if (!host) return; setConnecting(true); try { if (host.status === "connected") { await api.sshDisconnect(host.id); upsertHost({ ...host, status: "disconnected" }); } else { await api.sshConnect(host.id); upsertHost({ ...host, status: "connected", lastConnectedAt: new Date().toISOString() }); } } catch { upsertHost({ ...host, status: "error" }); } finally { setConnecting(false); } };
+  const changeLanguage = () => { const next = i18n.language.startsWith("zh") ? "en" : "zh"; i18n.changeLanguage(next); localStorage.setItem("locale", next); };
+  return <Box sx={{ height: "100%", display: "flex", flexDirection: "column" }}>
+    <AppBar position="static" color="inherit" elevation={0} sx={{ borderBottom: 1, borderColor: "divider", zIndex: 5 }}><Toolbar variant="dense" className="drag-region" sx={{ minHeight: "52px!important", px: 1.5 }}><Stack direction="row" alignItems="center" spacing={1.2}><Box sx={{ width: 32, height: 32, borderRadius: 2.5, display: "grid", placeItems: "center", color: "white", background: "linear-gradient(135deg, #2E5BFF, #6C63E8)" }}><TerminalRounded fontSize="small"/></Box><Typography variant="subtitle1" fontWeight={800}>{t("appName")}</Typography></Stack><Box sx={{ flex: 1 }}/><Stack className="no-drag" direction="row" alignItems="center" spacing={.5}><Tooltip title={t("language")}><IconButton onClick={changeLanguage}><LanguageRounded fontSize="small"/></IconButton></Tooltip><Tooltip title={t("theme")}><IconButton onClick={toggleMode}>{mode === "dark" ? <Brightness7Rounded fontSize="small"/> : <Brightness4Rounded fontSize="small"/>}</IconButton></Tooltip><Tooltip title={t("settings")}><IconButton><SettingsRounded fontSize="small"/></IconButton></Tooltip></Stack></Toolbar></AppBar>
+    <Box sx={{ display: "flex", flex: 1, minHeight: 0 }}><ServerSidebar onAdd={() => setHostDialog(true)}/><Box sx={{ flex: 1, minWidth: 0, display: "flex", flexDirection: "column" }}>
+      {host && <><Stack direction="row" alignItems="center" sx={{ minHeight: 50, px: 2, borderBottom: 1, borderColor: "divider", bgcolor: "background.paper" }}><Stack direction="row" alignItems="center" spacing={1}><Circle sx={{ fontSize: 10, color: host.status === "connected" ? "success.main" : host.status === "error" ? "error.main" : "text.disabled" }}/><Typography variant="subtitle2">{host.name}</Typography><Typography variant="caption" color="text.secondary" className="mono">{host.hostname}:{host.port}</Typography></Stack><Box sx={{ flex: 1 }}/><Button size="small" variant={host.status === "connected" ? "outlined" : "contained"} color={host.status === "connected" ? "inherit" : "primary"} onClick={toggleConnection} disabled={connecting} startIcon={connecting ? <CircularProgress size={16}/> : host.status === "connected" ? <CloudOffRounded/> : <TerminalRounded/>}>{host.status === "connected" ? t("disconnect") : t("connect")}</Button><IconButton size="small" onClick={(e) => setMenuEl(e.currentTarget)}><MoreVertRounded/></IconButton></Stack><Menu anchorEl={menuEl} open={!!menuEl} onClose={() => setMenuEl(null)}><MenuItem>编辑服务器</MenuItem><MenuItem>导出配置</MenuItem><Divider/><MenuItem sx={{ color: "error.main" }}>删除服务器</MenuItem></Menu>
+      <Tabs value={page} onChange={(_, value) => setPage(value)} sx={{ minHeight: 45, px: 1.5, bgcolor: "background.paper", borderBottom: 1, borderColor: "divider", "& .MuiTab-root": { minHeight: 45 } }}>{pages.map((p) => <Tab key={p.id} value={p.id} label={t(p.label)}/>)}</Tabs></>}
+      <Box sx={{ flex: 1, minHeight: 0, p: host ? 2 : 0 }}>{loading ? <Box sx={{ height: "100%", display: "grid", placeItems: "center" }}><CircularProgress/></Box> : startupError ? <Box sx={{ height: "100%", display: "grid", placeItems: "center", p: 3 }}><Stack alignItems="center" spacing={2}><Typography variant="h6" color="error">无法加载本地数据</Typography><Typography color="text.secondary" sx={{ maxWidth: 560, textAlign: "center", wordBreak: "break-word" }}>{startupError}</Typography><Button variant="contained" onClick={() => window.location.reload()}>重新加载</Button></Stack></Box> : !host ? <EmptyState onAdd={() => setHostDialog(true)}/> : page === "terminal" ? <TerminalView host={host}/> : page === "monitor" ? <MonitorView host={host}/> : page === "firewall" ? <FirewallView host={host}/> : page === "sftp" ? <SftpView host={host}/> : <ForwardingView host={host}/>}</Box>
+      <TransferDrawer/><CommandLedger/>
+    </Box></Box><HostDialog open={hostDialog} onClose={() => setHostDialog(false)}/>
+  </Box>;
+}
+function EmptyState({ onAdd }: { onAdd: () => void }) { return <Box sx={{ height: "100%", display: "grid", placeItems: "center" }}><Stack alignItems="center" spacing={2}><Box sx={{ width: 72, height: 72, borderRadius: 5, bgcolor: "action.hover", display: "grid", placeItems: "center" }}><TerminalRounded color="primary" sx={{ fontSize: 36 }}/></Box><Typography variant="h6">添加第一台 SSH 服务器</Typography><Typography color="text.secondary">服务器凭据仅保存在本机安全存储中</Typography><Button variant="contained" onClick={onAdd}>添加服务器</Button></Stack></Box>; }

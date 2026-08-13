@@ -1,0 +1,39 @@
+[package]
+name = "ssh-operations-terminal"
+version = "0.1.0"
+description = "Material Design SSH operations desktop terminal"
+authors = ["SSH Operations Terminal Contributors"]
+edition = "2024"
+
+[lib]
+name = "ssh_operations_terminal_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+tauri-plugin-fs = "2"
+tauri-plugin-opener = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+russh = { version = "0.62", default-features = false, features = ["ring", "rsa"] }
+russh-sftp = "2.3"
+rusqlite = { version = "0.37", features = ["bundled", "chrono"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+keyring = { version = "3", features = ["windows-native"] }
+thiserror = "2"
+sha2 = "0.10"
+hex = "0.4"
+zeroize = { version = "1", features = ["derive"] }
+bytes = "1"
+parking_lot = "0.12"
+futures = "0.3"
+base64 = "0.22"
+
+[dev-dependencies]
+tempfile = "3"
