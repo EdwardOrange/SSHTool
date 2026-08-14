@@ -20,4 +20,7 @@ function Root() {
   return <ThemeProvider theme={theme}><CssBaseline /><App mode={mode} toggleMode={toggle} /></ThemeProvider>;
 }
 
-ReactDOM.createRoot(document.getElementById("root")!).render(<React.StrictMode><AppErrorBoundary><Root /></AppErrorBoundary></React.StrictMode>);
+// A terminal session is an external, stateful resource. React StrictMode intentionally
+// remounts effects in development, which would create and immediately close a second
+// remote PTY. Keep the production and desktop development lifecycle identical.
+ReactDOM.createRoot(document.getElementById("root")!).render(<AppErrorBoundary><Root /></AppErrorBoundary>);

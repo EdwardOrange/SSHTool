@@ -10,11 +10,12 @@ import { useAppStore } from "../store";
 import type { HostProfile } from "../types";
 import { formatError } from "../utils";
 
-export default function TerminalView({ host }: { host: HostProfile }) {
+export default function TerminalView({ host, active = true }: { host: HostProfile; active?: boolean }) {
   const theme = useTheme();
   const settings = useAppStore((state) => state.settings);
   const containerRef = React.useRef<HTMLDivElement>(null);
   const termRef = React.useRef<Terminal | null>(null);
+  const fitAddonRef = React.useRef<FitAddon | null>(null);
   const searchAddonRef = React.useRef<SearchAddon | null>(null);
   const [search, setSearch] = React.useState("");
   const [error, setError] = React.useState("");
@@ -32,7 +33,7 @@ export default function TerminalView({ host }: { host: HostProfile }) {
     const finder = new SearchAddon();
     terminal.loadAddon(fit); terminal.loadAddon(finder); terminal.loadAddon(new WebLinksAddon());
     terminal.open(containerRef.current); fit.fit(); terminal.focus();
-    termRef.current = terminal; searchAddonRef.current = finder;
+    termRef.current = terminal; fitAddonRef.current = fit; searchAddonRef.current = finder;
     const encoder = new TextEncoder();
     const decoder = new TextDecoder();
 
@@ -65,7 +66,7 @@ export default function TerminalView({ host }: { host: HostProfile }) {
       disposed = true; inputSubscription.dispose(); observer.disconnect(); window.removeEventListener("keydown", onKey);
       const closingSession = sessionId;
       if (closingSession) void sendChain.finally(() => api.terminalClose(closingSession));
-      terminal.dispose(); termRef.current = null; searchAddonRef.current = null;
+      terminal.dispose(); termRef.current = null; fitAddonRef.current = null; searchAddonRef.current = null;
     };
   }, [host.id]);
 
@@ -75,6 +76,15 @@ export default function TerminalView({ host }: { host: HostProfile }) {
     if (settings?.terminalFontSize) termRef.current.options.fontSize = settings.terminalFontSize;
     if (settings?.terminalScrollback) termRef.current.options.scrollback = settings.terminalScrollback;
   }, [theme.palette.mode, settings?.terminalFontSize, settings?.terminalScrollback]);
+
+  React.useEffect(() => {
+    if (!active) return;
+    const frame = window.requestAnimationFrame(() => {
+      fitAddonRef.current?.fit();
+      termRef.current?.focus();
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [active]);
 
   const doSearch = () => { if (search) searchAddonRef.current?.findNext(search); };
   return <Stack sx={{ height: "100%", minHeight: 0 }} spacing={1}>

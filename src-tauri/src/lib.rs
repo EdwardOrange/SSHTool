@@ -256,13 +256,13 @@ async fn terminal_input(
     state.ssh.terminal_input(&session_id, data).await
 }
 #[tauri::command]
-fn terminal_resize(
+async fn terminal_resize(
     state: State<'_, AppState>,
     session_id: String,
     cols: u32,
     rows: u32,
 ) -> AppResult<()> {
-    state.ssh.terminal_resize(&session_id, cols, rows)
+    state.ssh.terminal_resize(&session_id, cols, rows).await
 }
 #[tauri::command]
 async fn terminal_close(state: State<'_, AppState>, session_id: String) -> AppResult<()> {
