@@ -13,7 +13,7 @@ use firewall::FirewallManager;
 use models::*;
 use monitor::MonitorManager;
 use parking_lot::Mutex;
-use ssh::{SshManager, TerminalAuditEvent};
+use ssh::{SshManager, TerminalAuditEvent, TerminalAuditEventKind};
 use std::{
     path::PathBuf,
     sync::{
@@ -238,10 +238,11 @@ async fn terminal_open(
     let command_sequence = state.command_sequence.clone();
     tokio::spawn(async move {
         while let Some(event) = audit_receiver.recv().await {
-            let command = security::redact(&event.command);
-            if command.trim().is_empty() { continue; }
+            let TerminalAuditEventKind::Command { command, exit_code } = event.kind else { continue };
+            let command = security::redact(&command);
+            if command.trim().is_empty() || command.trim_start().starts_with("__sshops_") { continue; }
             let host_name = db.host_get(&event.host_id).ok().map(|host| host.name);
-            let record = CommandRecord { id: Uuid::new_v4().to_string(), timestamp: event.timestamp, host_id: Some(event.host_id), host_name, source: "terminal".into(), command, stdout: String::new(), stderr: String::new(), exit_code: Some(event.exit_code), duration_ms: 0, status: if event.exit_code == 0 { "success".into() } else { "error".into() }, repeat_count: 1, equivalent: None, operation_kind: Some("terminal.shell".into()) };
+            let record = CommandRecord { id: format!("terminal:{}:{}", event.session_id, event.sequence), timestamp: event.timestamp, host_id: Some(event.host_id), host_name, source: "terminal".into(), command, stdout: String::new(), stderr: String::new(), exit_code: Some(exit_code), duration_ms: 0, status: if exit_code == 0 { "success".into() } else { "error".into() }, repeat_count: 1, equivalent: None, operation_kind: Some("terminal.shell".into()) };
             persist_and_emit_command(&db, &command_channels, &command_sequence, record);
         }
     });
@@ -714,6 +715,12 @@ pub fn run() {
                 Database::open(&dir.join("ssh-operations.db"))
                     .map_err(|e| Box::<dyn std::error::Error>::from(e.to_string()))?,
             );
+            if db.setting_get("migration.terminal-audit-v1-cleanup")?.is_none() {
+                match db.command_cleanup_legacy_terminal_bootstrap() {
+                    Ok(_) => { db.setting_set("migration.terminal-audit-v1-cleanup", "1")?; }
+                    Err(error) => eprintln!("Unable to clean legacy terminal audit records: {error}"),
+                }
+            }
             if let Ok(mut profiles) = db.forward_list("") {
                 for profile in &mut profiles {
                     profile.active = false;

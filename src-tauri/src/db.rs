@@ -103,6 +103,30 @@ impl Database {
         self.0.lock().execute("DELETE FROM command_log", [])?;
         Ok(())
     }
+    pub fn command_cleanup_legacy_terminal_bootstrap(&self) -> AppResult<usize> {
+        let connection = self.0.lock();
+        let mut statement = connection.prepare("SELECT id,data FROM command_log")?;
+        let rows = statement.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?;
+        let mut ids = Vec::new();
+        for row in rows {
+            let (id, data) = row?;
+            let Ok(record) = serde_json::from_str::<CommandRecord>(&data) else { continue };
+            if record.source == "terminal"
+                && record.operation_kind.as_deref() == Some("terminal.shell")
+                && record.command.trim_start().starts_with("__sshops_notice=''; if command -v base64")
+                && record.command.contains("__sshops_emit")
+                && record.command.contains("PROMPT_COMMAND")
+            {
+                ids.push(id);
+            }
+        }
+        drop(statement);
+        let mut removed = 0;
+        for id in ids {
+            removed += connection.execute("DELETE FROM command_log WHERE id=?1", [id])?;
+        }
+        Ok(removed)
+    }
     pub fn setting_get(&self, key: &str) -> AppResult<Option<String>> {
         Ok(self.0.lock().query_row("SELECT value FROM settings WHERE key=?1", [key], |r| r.get(0)).optional()?)
     }
@@ -167,5 +191,45 @@ impl Database {
     pub fn set_fingerprint(&self, host_id: &str, fingerprint: &str) -> AppResult<()> {
         self.0.lock().execute("INSERT INTO known_hosts(host_id,fingerprint,updated_at) VALUES(?1,?2,datetime('now')) ON CONFLICT(host_id) DO UPDATE SET fingerprint=excluded.fingerprint,updated_at=excluded.updated_at",params![host_id,fingerprint])?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn terminal_record(id: &str, command: &str) -> CommandRecord {
+        CommandRecord {
+            id: id.into(),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            host_id: Some("host-1".into()),
+            host_name: Some("Test".into()),
+            source: "terminal".into(),
+            command: command.into(),
+            stdout: String::new(),
+            stderr: String::new(),
+            exit_code: Some(0),
+            duration_ms: 0,
+            status: "success".into(),
+            repeat_count: 1,
+            equivalent: None,
+            operation_kind: Some("terminal.shell".into()),
+        }
+    }
+
+    #[test]
+    fn cleanup_removes_only_the_legacy_internal_bootstrap() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = Database::open(&directory.path().join("test.db")).unwrap();
+        database.command_add(&terminal_record(
+            "legacy",
+            "__sshops_notice=''; if command -v base64 >/dev/null; then __sshops_emit(){ :; }; PROMPT_COMMAND=__sshops_prompt; fi",
+        )).unwrap();
+        database.command_add(&terminal_record("normal", "printf '__sshops_notice' ")).unwrap();
+
+        assert_eq!(database.command_cleanup_legacy_terminal_bootstrap().unwrap(), 1);
+        let commands = database.commands(None).unwrap();
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].id, "normal");
     }
 }

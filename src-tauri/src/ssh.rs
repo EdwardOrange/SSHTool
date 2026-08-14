@@ -67,27 +67,41 @@ struct ManagedTerminal {
 pub struct TerminalAuditEvent {
     pub session_id: String,
     pub host_id: String,
-    pub command: String,
-    pub exit_code: i32,
+    pub sequence: u64,
+    pub kind: TerminalAuditEventKind,
     pub timestamp: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct ParsedTerminalAudit {
-    command: String,
-    exit_code: i32,
+pub enum TerminalAuditEventKind {
+    Ready { shell: String },
+    Command { command: String, exit_code: i32 },
+    Unavailable { reason: String },
 }
 
 const AUDIT_PREFIX: &[u8] = b"\x1b]777;sshops;";
-const SHELL_AUDIT_BOOTSTRAP: &str = r#"__sshops_notice=''; if command -v base64 >/dev/null 2>&1; then __sshops_emit(){ local __sshops_payload; __sshops_payload=$(printf '%s' "$2" | base64 | tr -d '\r\n'); printf '\033]777;sshops;%s;%s\007' "$1" "$__sshops_payload"; }; if [ -n "$BASH_VERSION" ]; then __sshops_ready=0; __sshops_last_hist=$HISTCMD; __sshops_prompt(){ local __sshops_status=$?; local __sshops_hist=$HISTCMD; if [ "$__sshops_ready" = 1 ] && [ "$__sshops_hist" != "$__sshops_last_hist" ]; then local __sshops_cmd; __sshops_cmd=$(builtin fc -ln -1 2>/dev/null); __sshops_cmd="${__sshops_cmd#"${__sshops_cmd%%[![:space:]]*}"}"; [ -n "$__sshops_cmd" ] && __sshops_emit "$__sshops_status" "$__sshops_cmd"; fi; __sshops_last_hist=$__sshops_hist; __sshops_ready=1; return $__sshops_status; }; PROMPT_COMMAND="__sshops_prompt${PROMPT_COMMAND:+;$PROMPT_COMMAND}"; elif [ -n "$ZSH_VERSION" ]; then autoload -Uz add-zsh-hook 2>/dev/null; __sshops_pending=''; __sshops_preexec(){ __sshops_pending="$1"; }; __sshops_precmd(){ local __sshops_status=$?; if [ -n "$__sshops_pending" ]; then __sshops_emit "$__sshops_status" "$__sshops_pending"; __sshops_pending=''; fi; return $__sshops_status; }; if ! add-zsh-hook preexec __sshops_preexec 2>/dev/null || ! add-zsh-hook precmd __sshops_precmd 2>/dev/null; then __sshops_notice='[SSH Ops] Zsh command audit is unavailable'; fi; else __sshops_notice='[SSH Ops] Command audit supports Bash and Zsh only'; fi; else __sshops_notice='[SSH Ops] Command audit requires base64'; fi; stty echo 2>/dev/null; [ -n "$__sshops_notice" ] && printf '\033[33m%s\033[0m\r\n' "$__sshops_notice""#;
+const AUDIT_VERSION: &str = "v1";
+const SHELL_AUDIT_BOOTSTRAP_TEMPLATE: &str = r#"__sshops_nonce='__NONCE__'; __sshops_notice=''; __sshops_seq=0; __sshops_pending=''; __sshops_last_line=''; __sshops_executed=0; __sshops_ready=0; __sshops_internal=1; if command -v base64 >/dev/null 2>&1; then __sshops_emit(){ local __sshops_kind="$1" __sshops_status="$2" __sshops_data="$3" __sshops_payload; __sshops_seq=$((__sshops_seq+1)); __sshops_payload=$(printf '%s' "$__sshops_data" | base64 | tr -d '\r\n'); printf '\033]777;sshops;v1;%s;%s;%s;%s;%s\007' "$__sshops_nonce" "$__sshops_kind" "$__sshops_seq" "$__sshops_status" "$__sshops_payload"; }; __sshops_ignored(){ local __sshops_line="$1" __sshops_pattern; case ":${HISTCONTROL:-}:" in *:ignorespace:*|*:ignoreboth:*) case "$__sshops_line" in ' '*) return 0;; esac;; esac; if [ -n "${HISTIGNORE:-}" ]; then local IFS=':'; for __sshops_pattern in $HISTIGNORE; do if [ "$__sshops_pattern" = '&' ]; then [ "$__sshops_line" = "$__sshops_last_line" ] && return 0; elif [ -n "$__sshops_pattern" ] && [[ "$__sshops_line" == $__sshops_pattern ]]; then return 0; fi; done; fi; return 1; }; __sshops_clean_history(){ local __sshops_entry __sshops_number; __sshops_entry=$(HISTTIMEFORMAT= builtin history 1 2>/dev/null) || return 0; case "$__sshops_entry" in *"$__sshops_nonce"*'__sshops_nonce='*) __sshops_entry="${__sshops_entry#"${__sshops_entry%%[![:space:]]*}"}"; __sshops_number="${__sshops_entry%%[!0-9]*}"; [ -n "$__sshops_number" ] && builtin history -d "$__sshops_number" 2>/dev/null || true;; esac; }; if [ -n "${BASH_VERSION:-}" ]; then __sshops_capture(){ local __sshops_line="${READLINE_LINE:-}" __sshops_expanded; __sshops_clean_history; __sshops_expanded=$(builtin history -p "$__sshops_line" 2>/dev/null) && [ -n "$__sshops_expanded" ] && __sshops_line="$__sshops_expanded"; if [ -n "$__sshops_line" ] && ! __sshops_ignored "$__sshops_line"; then __sshops_last_line="$__sshops_line"; if [ -n "$__sshops_pending" ]; then __sshops_pending="$__sshops_pending
+$__sshops_line"; else __sshops_pending="$__sshops_line"; fi; fi; }; __sshops_debug(){ local __sshops_command="$1"; if [ "$__sshops_internal" = 0 ] && [ -n "$__sshops_pending" ]; then case "$__sshops_command" in __sshops_*|'builtin history'*|'bind '*) ;; *) __sshops_executed=1;; esac; fi; if [ -n "${__sshops_previous_debug:-}" ]; then eval -- "$__sshops_previous_debug"; fi; }; __sshops_precmd(){ local __sshops_status=$?; __sshops_internal=1; __sshops_clean_history; if [ "$__sshops_ready" = 0 ]; then __sshops_ready=1; __sshops_emit ready 0 bash; elif [ "$__sshops_executed" = 1 ] && [ -n "$__sshops_pending" ]; then __sshops_emit command "$__sshops_status" "$__sshops_pending"; fi; __sshops_pending=''; __sshops_executed=0; __sshops_internal=0; return "$__sshops_status"; }; __sshops_previous_debug=$(trap -p DEBUG); __sshops_previous_debug="${__sshops_previous_debug#trap -- \'}"; __sshops_previous_debug="${__sshops_previous_debug%\' DEBUG}"; bind -x '"\C-x\C-a":__sshops_capture' 2>/dev/null && bind '"\C-x\C-z":accept-line' 2>/dev/null && bind '"\C-j":"\C-x\C-a\C-x\C-z"' 2>/dev/null && bind '"\C-m":"\C-x\C-a\C-x\C-z"' 2>/dev/null || __sshops_notice='[SSH Ops] Bash command audit is unavailable'; if [ -z "$__sshops_notice" ]; then trap '__sshops_debug "$BASH_COMMAND"' DEBUG; if [[ $(declare -p PROMPT_COMMAND 2>/dev/null) == 'declare -a'* ]]; then PROMPT_COMMAND+=(__sshops_precmd); else PROMPT_COMMAND="${PROMPT_COMMAND:+$PROMPT_COMMAND; }__sshops_precmd"; fi; fi; elif [ -n "${ZSH_VERSION:-}" ]; then autoload -Uz add-zsh-hook 2>/dev/null; __sshops_preexec(){ __sshops_pending="$1"; __sshops_executed=1; }; __sshops_precmd(){ local __sshops_status=$?; if [ "$__sshops_ready" = 0 ]; then __sshops_ready=1; __sshops_emit ready 0 zsh; elif [ "$__sshops_executed" = 1 ] && [ -n "$__sshops_pending" ]; then __sshops_emit command "$__sshops_status" "$__sshops_pending"; fi; __sshops_pending=''; __sshops_executed=0; return "$__sshops_status"; }; if ! add-zsh-hook preexec __sshops_preexec 2>/dev/null || ! add-zsh-hook precmd __sshops_precmd 2>/dev/null; then __sshops_notice='[SSH Ops] Zsh command audit is unavailable'; fi; else __sshops_notice='[SSH Ops] Command audit supports Bash and Zsh only'; fi; if [ -n "$__sshops_notice" ]; then __sshops_emit unavailable 0 "$__sshops_notice"; fi; else __sshops_notice='[SSH Ops] Command audit requires base64'; __sshops_seq=1; printf '\033]777;sshops;v1;%s;unavailable;1;0;W1NTSCBPcHNdIENvbW1hbmQgYXVkaXQgcmVxdWlyZXMgYmFzZTY0\007' "$__sshops_nonce"; fi; __sshops_internal=0; stty echo 2>/dev/null; [ -n "$__sshops_notice" ] && printf '\033[33m%s\033[0m\r\n' "$__sshops_notice""#;
 
-#[derive(Default)]
+fn shell_audit_bootstrap(nonce: &str) -> String {
+    SHELL_AUDIT_BOOTSTRAP_TEMPLATE.replace("__NONCE__", nonce)
+}
+
 struct TerminalAuditParser {
     pending: Vec<u8>,
+    expected_nonce: String,
+    ready: bool,
+    settled: bool,
+    last_sequence: u64,
 }
 
 impl TerminalAuditParser {
-    fn push(&mut self, data: &[u8]) -> (Vec<u8>, Vec<ParsedTerminalAudit>) {
+    fn new(expected_nonce: String) -> Self {
+        Self { pending: Vec::new(), expected_nonce, ready: false, settled: false, last_sequence: 0 }
+    }
+
+    fn push(&mut self, data: &[u8]) -> (Vec<u8>, Vec<(u64, TerminalAuditEventKind)>) {
         self.pending.extend_from_slice(data);
         let mut visible = Vec::new();
         let mut audits = Vec::new();
@@ -106,22 +120,55 @@ impl TerminalAuditParser {
             let end = AUDIT_PREFIX.len() + end_relative;
             let frame = self.pending[AUDIT_PREFIX.len()..end].to_vec();
             self.pending.drain(..=end);
-            if let Some(audit) = parse_audit_frame(&frame) { audits.push(audit); }
+            let Some((nonce, sequence, kind)) = parse_audit_frame(&frame) else { continue };
+            if nonce != self.expected_nonce || sequence <= self.last_sequence { continue; }
+            if matches!(&kind, TerminalAuditEventKind::Command { .. }) && !self.ready { continue; }
+            self.last_sequence = sequence;
+            match &kind {
+                TerminalAuditEventKind::Ready { .. } => {
+                    self.ready = true;
+                    self.settled = true;
+                }
+                TerminalAuditEventKind::Unavailable { .. } => self.settled = true,
+                TerminalAuditEventKind::Command { command, .. } if is_internal_audit_command(command, &self.expected_nonce) => continue,
+                TerminalAuditEventKind::Command { .. } => {}
+            }
+            audits.push((sequence, kind));
         }
         (visible, audits)
     }
 
     fn finish(&mut self) -> Vec<u8> { std::mem::take(&mut self.pending) }
+
+    fn settled(&self) -> bool { self.settled }
 }
 
 fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> { haystack.windows(needle.len()).position(|window| window == needle) }
 fn partial_prefix_len(data: &[u8], prefix: &[u8]) -> usize { (1..prefix.len().min(data.len() + 1)).rev().find(|length| data.ends_with(&prefix[..*length])).unwrap_or(0) }
-fn parse_audit_frame(frame: &[u8]) -> Option<ParsedTerminalAudit> {
+fn parse_audit_frame(frame: &[u8]) -> Option<(String, u64, TerminalAuditEventKind)> {
     let frame = std::str::from_utf8(frame).ok()?;
-    let (status, encoded) = frame.split_once(';')?;
-    let command = String::from_utf8(BASE64_STANDARD.decode(encoded).ok()?).ok()?;
-    if command.trim().is_empty() || command.len() > 10_000 { return None; }
-    Some(ParsedTerminalAudit { command, exit_code: status.parse().ok()? })
+    let mut fields = frame.splitn(6, ';');
+    if fields.next()? != AUDIT_VERSION { return None; }
+    let nonce = fields.next()?.to_string();
+    if nonce.len() < 16 || nonce.len() > 64 || !nonce.bytes().all(|byte| byte.is_ascii_hexdigit()) { return None; }
+    let event_kind = fields.next()?;
+    let sequence = fields.next()?.parse().ok()?;
+    let exit_code = fields.next()?.parse().ok()?;
+    let payload = String::from_utf8(BASE64_STANDARD.decode(fields.next()?).ok()?).ok()?;
+    if payload.len() > 10_000 { return None; }
+    let kind = match event_kind {
+        "ready" if !payload.trim().is_empty() => TerminalAuditEventKind::Ready { shell: payload },
+        "command" if !payload.trim().is_empty() => TerminalAuditEventKind::Command { command: payload, exit_code },
+        "unavailable" if !payload.trim().is_empty() => TerminalAuditEventKind::Unavailable { reason: payload },
+        _ => return None,
+    };
+    Some((nonce, sequence, kind))
+}
+
+fn is_internal_audit_command(command: &str, nonce: &str) -> bool {
+    command.contains(nonce)
+        || command.trim_start().starts_with("__sshops_")
+        || (command.contains("__sshops_nonce=") && command.contains("__sshops_emit"))
 }
 
 pub struct SshManager {
@@ -611,14 +658,19 @@ impl SshManager {
         let hid = host_id.to_string();
         let sequence = self.sequence.clone();
         let mut writer = channel.make_writer();
+        let audit_nonce = Uuid::new_v4().simple().to_string();
         if command_logging {
-            writer.write_all(SHELL_AUDIT_BOOTSTRAP.as_bytes()).await.map_err(AppError::Io)?;
+            let bootstrap = shell_audit_bootstrap(&audit_nonce);
+            writer.write_all(bootstrap.as_bytes()).await.map_err(AppError::Io)?;
             // The bootstrap is an interactive shell command and must be submitted.
             writer.write_all(b"\n").await.map_err(AppError::Io)?;
             writer.flush().await.map_err(AppError::Io)?;
         }
         tokio::spawn(async move {
-            let mut audit_parser = TerminalAuditParser::default();
+            let mut audit_parser = TerminalAuditParser::new(audit_nonce);
+            let audit_timeout = tokio::time::sleep(Duration::from_secs(8));
+            tokio::pin!(audit_timeout);
+            let mut audit_timeout_pending = command_logging;
             loop {
                 tokio::select! {
                     command=receiver.recv()=>match command {
@@ -630,11 +682,17 @@ impl SshManager {
                         Some(ChannelMsg::Data{data})|Some(ChannelMsg::ExtendedData{data,..})=>{
                             let (visible, audits) = if command_logging { audit_parser.push(&data) } else { (data.to_vec(), Vec::new()) };
                             if !visible.is_empty() { let _=ipc.send(StreamEnvelope{seq:sequence.fetch_add(1,Ordering::Relaxed),timestamp:chrono::Utc::now().to_rfc3339(),host_id:hid.clone(),session_id:Some(id.clone()),payload:visible}); }
-                            for audit in audits { let _ = audit_sender.send(TerminalAuditEvent { session_id: id.clone(), host_id: hid.clone(), command: audit.command, exit_code: audit.exit_code, timestamp: chrono::Utc::now().to_rfc3339() }); }
+                            if audit_parser.settled() { audit_timeout_pending = false; }
+                            for (audit_sequence, kind) in audits { let _ = audit_sender.send(TerminalAuditEvent { session_id: id.clone(), host_id: hid.clone(), sequence: audit_sequence, kind, timestamp: chrono::Utc::now().to_rfc3339() }); }
                         },
                         Some(ChannelMsg::ExitStatus{..})|None=>break,
                         _=>{}
-                    }
+                    },
+                    _=&mut audit_timeout, if audit_timeout_pending=>{
+                        audit_timeout_pending=false;
+                        let notice=b"\r\n\x1b[33m[SSH Ops] Command audit did not initialize; terminal input is not being recorded.\x1b[0m\r\n".to_vec();
+                        let _=ipc.send(StreamEnvelope{seq:sequence.fetch_add(1,Ordering::Relaxed),timestamp:chrono::Utc::now().to_rfc3339(),host_id:hid.clone(),session_id:Some(id.clone()),payload:notice});
+                    },
                 }
             }
             if command_logging { let remaining = audit_parser.finish(); if !remaining.is_empty() { let _=ipc.send(StreamEnvelope{seq:sequence.fetch_add(1,Ordering::Relaxed),timestamp:chrono::Utc::now().to_rfc3339(),host_id:hid,session_id:Some(id),payload:remaining}); } }
@@ -1019,45 +1077,119 @@ async fn socks5_connect(stream: &mut TcpStream) -> AppResult<(String, u16)> {
 mod terminal_audit_tests {
     use super::*;
 
-    fn marker(status: i32, command: &str) -> Vec<u8> {
-        format!("\x1b]777;sshops;{};{}\x07", status, BASE64_STANDARD.encode(command)).into_bytes()
+    const NONCE: &str = "0123456789abcdef0123456789abcdef";
+
+    fn marker(sequence: u64, kind: &str, status: i32, payload: &str) -> Vec<u8> {
+        format!(
+            "\x1b]777;sshops;v1;{NONCE};{kind};{sequence};{status};{}\x07",
+            BASE64_STANDARD.encode(payload)
+        )
+        .into_bytes()
     }
 
     #[test]
-    fn parses_marker_split_across_ssh_packets_and_preserves_visible_output() {
-        let frame = marker(0, "sudo apt update");
+    fn parses_split_frames_and_preserves_visible_output() {
+        let ready = marker(1, "ready", 0, "bash");
+        let frame = marker(2, "command", 0, "sudo apt update");
         let split = frame.len() / 2;
-        let mut parser = TerminalAuditParser::default();
-        let (first_visible, first_audits) = parser.push(&[b"prompt> ".as_slice(), &frame[..split]].concat());
+        let mut parser = TerminalAuditParser::new(NONCE.into());
+        assert_eq!(parser.push(&ready).1, vec![(1, TerminalAuditEventKind::Ready { shell: "bash".into() })]);
+        let (first_visible, first_events) = parser.push(&[b"prompt> ".as_slice(), &frame[..split]].concat());
         assert_eq!(first_visible, b"prompt> ");
-        assert!(first_audits.is_empty());
-        let (second_visible, second_audits) = parser.push(&[&frame[split..], b"next prompt".as_slice()].concat());
+        assert!(first_events.is_empty());
+        let (second_visible, second_events) = parser.push(&[&frame[split..], b"next prompt".as_slice()].concat());
         assert_eq!(second_visible, b"next prompt");
-        assert_eq!(second_audits, vec![ParsedTerminalAudit { command: "sudo apt update".into(), exit_code: 0 }]);
+        assert_eq!(second_events, vec![(2, TerminalAuditEventKind::Command { command: "sudo apt update".into(), exit_code: 0 })]);
     }
 
     #[test]
-    fn preserves_the_first_command_field_and_unicode() {
-        let mut parser = TerminalAuditParser::default();
-        let (_, audits) = parser.push(&marker(7, "printf '中文参数' | sed s/参数/命令/"));
-        assert_eq!(audits[0].command, "printf '中文参数' | sed s/参数/命令/");
-        assert_eq!(audits[0].exit_code, 7);
+    fn preserves_first_command_field_unicode_and_exit_code() {
+        let command = "printf '中文参数' | sed s/参数/命令/";
+        let mut parser = TerminalAuditParser::new(NONCE.into());
+        parser.push(&marker(1, "ready", 0, "bash"));
+        assert_eq!(parser.push(&marker(2, "command", 7, command)).1, vec![(2, TerminalAuditEventKind::Command { command: command.into(), exit_code: 7 })]);
+    }
+
+    #[test]
+    fn rejects_wrong_nonce_replays_and_commands_before_ready() {
+        let mut parser = TerminalAuditParser::new(NONCE.into());
+        assert!(parser.push(&marker(1, "command", 0, "whoami")).1.is_empty());
+        let wrong = format!(
+            "\x1b]777;sshops;v1;ffffffffffffffffffffffffffffffff;ready;2;0;{}\x07",
+            BASE64_STANDARD.encode("bash")
+        );
+        assert!(parser.push(wrong.as_bytes()).1.is_empty());
+        assert_eq!(parser.push(&marker(3, "ready", 0, "bash")).1.len(), 1);
+        assert!(parser.push(&marker(3, "command", 0, "replayed")).1.is_empty());
+    }
+
+    #[test]
+    fn filters_internal_bootstrap_after_ready() {
+        let mut parser = TerminalAuditParser::new(NONCE.into());
+        parser.push(&marker(1, "ready", 0, "bash"));
+        assert!(parser.push(&marker(2, "command", 0, &shell_audit_bootstrap(NONCE))).1.is_empty());
     }
 
     #[test]
     fn leaves_unrelated_osc_sequences_visible() {
-        let mut parser = TerminalAuditParser::default();
+        let mut parser = TerminalAuditParser::new(NONCE.into());
         let input = b"\x1b]0;window title\x07hello";
-        let (visible, audits) = parser.push(input);
+        let (visible, events) = parser.push(input);
         assert_eq!(visible, input);
-        assert!(audits.is_empty());
+        assert!(events.is_empty());
     }
 
     #[test]
-    fn audit_bootstrap_does_not_clear_the_login_banner_or_replay_sudo_history() {
-        assert!(!SHELL_AUDIT_BOOTSTRAP.contains("[2J"));
-        assert!(!SHELL_AUDIT_BOOTSTRAP.contains("sudo su"));
-        assert!(SHELL_AUDIT_BOOTSTRAP.contains("__sshops_ready"));
+    fn bootstrap_preserves_terminal_output_and_installs_safe_hooks() {
+        let bootstrap = shell_audit_bootstrap(NONCE);
+        assert!(!bootstrap.contains("[2J"));
+        assert!(!bootstrap.contains("sudo su"));
+        assert!(bootstrap.contains("READLINE_LINE"));
+        assert!(bootstrap.contains("PROMPT_COMMAND+=(__sshops_precmd)"));
+        assert!(bootstrap.contains("trap -p DEBUG"));
+    }
+
+    #[test]
+    fn bash_integration_captures_complete_commands_without_the_bootstrap() {
+        use std::io::Write as _;
+        use std::process::{Command, Stdio};
+
+        let candidates = [
+            PathBuf::from(r"C:\msys64\usr\bin\bash.exe"),
+            PathBuf::from(r"C:\Program Files\Git\bin\bash.exe"),
+            PathBuf::from("/bin/bash"),
+        ];
+        let Some(bash) = candidates.into_iter().find(|path| path.exists()) else { return };
+        let mut child = Command::new(bash)
+            .args(["--noprofile", "--norc", "-i"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let input = format!(
+            "PATH=/usr/bin:$PATH\nHISTCONTROL=ignoreboth\nPROMPT_COMMAND=('true')\ntrap ':' DEBUG\n{}\nprintf 'first field 中文\\n'\nprintf 'repeat\\n'\nprintf 'repeat\\n'\nprintf 'pipe\\n' | tr a-z A-Z\nfalse\n printf 'hidden\\n'\nexit\n",
+            shell_audit_bootstrap(NONCE)
+        );
+        child.stdin.take().unwrap().write_all(input.as_bytes()).unwrap();
+        let output = child.wait_with_output().unwrap();
+        let mut parser = TerminalAuditParser::new(NONCE.into());
+        let (_, events) = parser.push(&output.stdout);
+        let commands = events
+            .into_iter()
+            .filter_map(|(_, event)| match event {
+                TerminalAuditEventKind::Command { command, exit_code } => Some((command, exit_code)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(commands, vec![
+            ("printf 'first field 中文\\n'".into(), 0),
+            ("printf 'repeat\\n'".into(), 0),
+            ("printf 'repeat\\n'".into(), 0),
+            ("printf 'pipe\\n' | tr a-z A-Z".into(), 0),
+            ("false".into(), 1),
+        ]);
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("__sshops_notice="));
     }
 
     #[test]
@@ -1075,7 +1207,7 @@ mod terminal_audit_tests {
     }
 
     #[test]
-    fn remote_copy_rejects_the_same_path_and_descendants() {
+    fn remote_copy_rejects_same_path_and_descendants() {
         assert!(validate_remote_copy_target("/srv/data", "/srv").is_err());
         assert!(validate_remote_copy_target("/srv/data", "/srv/data/subdir").is_err());
         assert!(validate_remote_copy_target("/srv/data", "/backup").is_ok());
