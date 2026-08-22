@@ -3,7 +3,7 @@ import type { AppSettings, CommandRecord, CommandSuppressionRule, FirewallPlan, 
 
 const isTauri = () => "__TAURI_INTERNALS__" in window;
 const now = () => new Date().toISOString();
-export const defaultSettings = (): AppSettings => ({ version: 1, locale: "zh", theme: "system", defaultPage: "monitor", terminalFontSize: 13, terminalScrollback: 10000, terminalPasteProtection: true, terminalCommandLogging: true, monitorIntervalSeconds: 2, transferConflictPolicy: "ask", commandRetentionDays: 7, commandRetentionMb: 100, suppressionRules: [{ id: "monitor-sample", enabled: true, source: "monitor", contains: "cat /proc/stat" }] });
+export const defaultSettings = (): AppSettings => ({ version: 2, locale: "zh", theme: "system", defaultPage: "monitor", terminalFontSize: 13, terminalScrollback: 10000, terminalPasteProtection: true, terminalCommandLogging: true, monitorIntervalSeconds: 2, transferConflictPolicy: "ask", commandRetentionDays: 7, commandRetentionMb: 100, suppressionRules: [{ id: "monitor-sample", enabled: true, source: "monitor", operationKind: "monitor.sample" }] });
 const demoHosts: HostProfile[] = [
   { id: "demo-prod", name: "生产网关", hostname: "10.0.1.12", port: 22, username: "ops", groupName: "生产环境", tags: ["gateway", "ubuntu"], favorite: true, authMethod: "key", jumpHosts: [], status: "connected", lastConnectedAt: now(), createdAt: now(), updatedAt: now() },
   { id: "demo-db", name: "数据节点", hostname: "10.0.1.24", port: 22, username: "admin", groupName: "生产环境", tags: ["database"], favorite: true, authMethod: "key", jumpHosts: [], status: "disconnected", createdAt: now(), updatedAt: now() },
@@ -72,6 +72,7 @@ export const api = {
     await invoke("command_log_export", { path, hostId: hostId || null });
   },
   async commandLogClear(): Promise<void> { if (isTauri()) await invoke("command_log_clear"); },
+  async configExport(path: string, hostId?: string): Promise<void> { if (isTauri()) await invoke("config_export", { path, hostId: hostId || null }); else { const host = mockHosts.find((item) => item.id === hostId); const blob = new Blob([JSON.stringify({ version: 2, hosts: host ? [{ ...host, credentialId: undefined, status: "disconnected" }] : mockHosts.map((item) => ({ ...item, credentialId: undefined, status: "disconnected" })) }, null, 2)], { type: "application/json" }); const url = URL.createObjectURL(blob); const anchor = document.createElement("a"); anchor.href = url; anchor.download = path || "ssh-config.json"; anchor.click(); URL.revokeObjectURL(url); } },
   async sftpList(hostId: string, path: string): Promise<SftpEntry[]> { return isTauri() ? invoke("sftp_list", { hostId, path }) : [{ name: "etc", path: "/etc", kind: "directory", size: 0, permissions: "drwxr-xr-x" }, { name: "var", path: "/var", kind: "directory", size: 0, permissions: "drwxr-xr-x" }, { name: "README.txt", path: "/README.txt", kind: "file", size: 4280, permissions: "-rw-r--r--", modifiedAt: now() }]; },
   async sftpUpload(hostId: string, localPaths: string[], remoteDirectory: string, onData: (event: StreamEnvelope<TransferProgress>) => void): Promise<string> {
     if (!isTauri()) return "";

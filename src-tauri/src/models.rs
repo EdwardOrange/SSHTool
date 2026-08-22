@@ -56,6 +56,7 @@ pub struct CommandSuppressionRule {
     pub enabled: bool,
     pub source: Option<String>,
     pub host_id: Option<String>,
+    pub operation_kind: Option<String>,
     pub contains: Option<String>,
 }
 

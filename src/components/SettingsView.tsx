@@ -3,8 +3,10 @@ import { Alert, Box, Button, CardContent, Chip, Dialog, DialogContent, DialogTit
 import React from "react";
 import { useTranslation } from "react-i18next";
 import { api } from "../api";
+import { commandMatchesSuppression } from "../commandSuppression";
 import { useAppStore } from "../store";
 import type { AppSettings, CommandSuppressionRule } from "../types";
+import { formatError } from "../utils";
 
 interface SettingsViewProps {
   open: boolean;
@@ -44,7 +46,7 @@ export default function SettingsView({ open, onClose, onTheme }: SettingsViewPro
     saveChain.current = saveChain.current
       .catch(() => undefined)
       .then(() => api.settingsUpdate(next))
-      .catch((reason) => setError(String(reason)))
+      .catch((reason) => setError(formatError(reason)))
       .finally(finishWrite);
   };
 
@@ -78,7 +80,7 @@ export default function SettingsView({ open, onClose, onTheme }: SettingsViewPro
         onTheme(next.theme);
         void i18n.changeLanguage(next.locale);
       })
-      .catch((reason) => setError(String(reason)))
+      .catch((reason) => setError(formatError(reason)))
       .finally(finishWrite);
   };
 
@@ -121,22 +123,24 @@ export default function SettingsView({ open, onClose, onTheme }: SettingsViewPro
 
 function CommandSettings({ settings, update }: { settings: AppSettings; update: (patch: Partial<AppSettings>) => void }) {
   const hosts = useAppStore((state) => state.hosts);
+  const commands = useAppStore((state) => state.commands);
   const [draft, setDraft] = React.useState("");
   const [draftSource, setDraftSource] = React.useState<CommandSuppressionRule["source"]>();
   const [draftHost, setDraftHost] = React.useState<string>();
+  const [draftOperationKind, setDraftOperationKind] = React.useState<string>();
   const add = () => {
-    if (!draft.trim() && !draftSource && !draftHost) return;
-    const rule: CommandSuppressionRule = { id: crypto.randomUUID(), enabled: true, source: draftSource, hostId: draftHost, contains: draft.trim() || undefined };
+    if (!draft.trim() && !draftSource && !draftHost && !draftOperationKind) return;
+    const rule: CommandSuppressionRule = { id: crypto.randomUUID(), enabled: true, source: draftSource, hostId: draftHost, operationKind: draftOperationKind, contains: draft.trim() || undefined };
     update({ suppressionRules: [...settings.suppressionRules, rule] });
-    setDraft(""); setDraftSource(undefined); setDraftHost(undefined);
+    setDraft(""); setDraftSource(undefined); setDraftHost(undefined); setDraftOperationKind(undefined);
   };
   return <Stack spacing={2} maxWidth={760}>
     <Typography variant="subtitle1" fontWeight={700}>保留策略</Typography>
     <Stack direction="row" spacing={2}><TextField label="保留天数" type="number" value={settings.commandRetentionDays} onChange={(event) => update({ commandRetentionDays: Math.max(1, Number(event.target.value)) })}/><TextField label="最大容量 MB" type="number" value={settings.commandRetentionMb} onChange={(event) => update({ commandRetentionMb: Math.max(10, Number(event.target.value)) })}/></Stack>
     <Typography variant="subtitle1" fontWeight={700}>屏蔽规则</Typography>
-    <Typography variant="body2" color="text.secondary">模块、服务器和命令文本条件同时满足时隐藏；规则不会删除审计记录。</Typography>
-    <Stack direction="row" spacing={1}><Select size="small" displayEmpty value={draftSource || ""} onChange={(event) => setDraftSource((event.target.value || undefined) as CommandSuppressionRule["source"])}><MenuItem value="">全部模块</MenuItem>{["connection", "terminal", "monitor", "firewall", "sftp", "forward", "system"].map((source) => <MenuItem key={source} value={source}>{source}</MenuItem>)}</Select><Select size="small" displayEmpty value={draftHost || ""} onChange={(event) => setDraftHost(event.target.value || undefined)}><MenuItem value="">全部服务器</MenuItem>{hosts.map((host) => <MenuItem key={host.id} value={host.id}>{host.name}</MenuItem>)}</Select><TextField fullWidth size="small" label="命令包含文本" value={draft} onChange={(event) => setDraft(event.target.value)} onKeyDown={(event) => event.key === "Enter" && add()}/><Button variant="contained" startIcon={<AddRounded/>} onClick={add}>添加</Button></Stack>
-    {settings.suppressionRules.map((rule) => <Stack key={rule.id} direction="row" alignItems="center" spacing={1}><Switch checked={rule.enabled} onChange={(event) => update({ suppressionRules: settings.suppressionRules.map((item) => item.id === rule.id ? { ...item, enabled: event.target.checked } : item) })}/><Chip label={`${rule.source || "全部模块"} · ${rule.hostId ? hosts.find((host) => host.id === rule.hostId)?.name || "指定服务器" : "全部服务器"} · ${rule.contains || "全部命令"}`} sx={{ flex: 1, justifyContent: "flex-start" }}/><IconButton color="error" onClick={() => update({ suppressionRules: settings.suppressionRules.filter((item) => item.id !== rule.id) })}><DeleteOutlineRounded/></IconButton></Stack>)}
+    <Typography variant="body2" color="text.secondary">模块、服务器、操作类型和命令文本条件同时满足时隐藏；规则不会删除审计记录。</Typography>
+    <Stack direction="row" spacing={1}><Select size="small" displayEmpty value={draftSource || ""} onChange={(event) => setDraftSource((event.target.value || undefined) as CommandSuppressionRule["source"])}><MenuItem value="">全部模块</MenuItem>{["connection", "terminal", "monitor", "firewall", "sftp", "forward", "system"].map((source) => <MenuItem key={source} value={source}>{source}</MenuItem>)}</Select><Select size="small" displayEmpty value={draftOperationKind || ""} onChange={(event) => setDraftOperationKind(event.target.value || undefined)}><MenuItem value="">全部操作</MenuItem>{["connection", "terminal.shell", "monitor.sample", "firewall", "sftp", "sftp.list", "forward"].map((kind) => <MenuItem key={kind} value={kind}>{kind}</MenuItem>)}</Select><Select size="small" displayEmpty value={draftHost || ""} onChange={(event) => setDraftHost(event.target.value || undefined)}><MenuItem value="">全部服务器</MenuItem>{hosts.map((host) => <MenuItem key={host.id} value={host.id}>{host.name}</MenuItem>)}</Select><TextField fullWidth size="small" label="命令包含文本" value={draft} onChange={(event) => setDraft(event.target.value)} onKeyDown={(event) => event.key === "Enter" && add()}/><Button variant="contained" startIcon={<AddRounded/>} onClick={add}>添加</Button></Stack>
+    {settings.suppressionRules.map((rule) => <Stack key={rule.id} direction="row" alignItems="center" spacing={1}><Switch checked={rule.enabled} onChange={(event) => update({ suppressionRules: settings.suppressionRules.map((item) => item.id === rule.id ? { ...item, enabled: event.target.checked } : item) })}/><Chip label={`${rule.source || "全部模块"} · ${rule.operationKind || "全部操作"} · ${rule.hostId ? hosts.find((host) => host.id === rule.hostId)?.name || "指定服务器" : "全部服务器"} · ${rule.contains || "全部命令"} · 匹配 ${commands.filter((command) => commandMatchesSuppression(command, rule)).length}`} sx={{ flex: 1, justifyContent: "flex-start" }}/><IconButton color="error" onClick={() => update({ suppressionRules: settings.suppressionRules.filter((item) => item.id !== rule.id) })}><DeleteOutlineRounded/></IconButton></Stack>)}
     <Divider/><Alert severity="warning">清空命令记录会永久删除 SQLite 中的全部历史。</Alert>
   </Stack>;
 }

@@ -108,9 +108,13 @@ fn hosts_upsert(state: State<'_, AppState>, draft: HostDraft) -> AppResult<HostP
     let now = Utc::now().to_rfc3339();
     let id = draft.id.unwrap_or_else(|| Uuid::new_v4().to_string());
     let existing = state.db.host_get(&id).ok();
+    let old_credential_id = existing.as_ref().and_then(|host| host.credential_id.clone());
     let mut credential_id = draft
         .credential_id
         .or_else(|| existing.as_ref().and_then(|h| h.credential_id.clone()));
+    if draft.auth_method != "password" || draft.remember_password == Some(false) {
+        credential_id = None;
+    }
     if draft.remember_password.unwrap_or(false) {
         if let Some(password) = draft.password.as_deref() {
             let cid = credential_id.unwrap_or_else(|| format!("ssh:{id}"));
@@ -144,18 +148,22 @@ fn hosts_upsert(state: State<'_, AppState>, draft: HostDraft) -> AppResult<HostP
         updated_at: now,
     };
     state.db.host_upsert(&host)?;
+    if old_credential_id.as_deref() != host.credential_id.as_deref() {
+        if let Some(old) = old_credential_id { let _ = security::delete_secret(&old); }
+    }
     Ok(host)
 }
 #[tauri::command]
 async fn hosts_delete(state: State<'_, AppState>, id: String) -> AppResult<()> {
     state.monitor.stop(&id);
-    state.ssh.disconnect(&id).await?;
-    if let Ok(host) = state.db.host_get(&id) {
-        if let Some(cid) = host.credential_id {
-            let _ = security::delete_secret(&cid);
-        }
+    if let Ok(profiles) = state.db.forward_list(&id) {
+        for profile in profiles { state.ssh.forward_stop(&profile.id); }
     }
-    state.db.host_delete(&id)
+    let credential_id = state.db.host_get(&id).ok().and_then(|host| host.credential_id);
+    let _ = state.ssh.disconnect(&id).await;
+    state.db.host_delete(&id)?;
+    if let Some(cid) = credential_id { let _ = security::delete_secret(&cid); }
+    Ok(())
 }
 #[tauri::command]
 fn credentials_set(id: String, value: String) -> AppResult<()> {
@@ -391,16 +399,45 @@ fn command_log_clear(state: State<'_, AppState>) -> AppResult<()> {
 }
 
 fn default_settings() -> AppSettings {
-    AppSettings { version: 1, locale: "zh".into(), theme: "system".into(), default_page: "monitor".into(), terminal_font_size: 13, terminal_scrollback: 10000, terminal_paste_protection: true, terminal_command_logging: true, monitor_interval_seconds: 2, transfer_conflict_policy: "ask".into(), command_retention_days: 7, command_retention_mb: 100, suppression_rules: vec![CommandSuppressionRule { id: "monitor-sample".into(), enabled: true, source: Some("monitor".into()), host_id: None, contains: Some("cat /proc/stat".into()) }] }
+    AppSettings { version: 2, locale: "zh".into(), theme: "system".into(), default_page: "monitor".into(), terminal_font_size: 13, terminal_scrollback: 10000, terminal_paste_protection: true, terminal_command_logging: true, monitor_interval_seconds: 2, transfer_conflict_policy: "ask".into(), command_retention_days: 7, command_retention_mb: 100, suppression_rules: vec![CommandSuppressionRule { id: "monitor-sample".into(), enabled: true, source: Some("monitor".into()), host_id: None, operation_kind: Some("monitor.sample".into()), contains: None }] }
+}
+
+fn normalize_settings(mut settings: AppSettings) -> AppSettings {
+    if settings.version < 2 {
+        for rule in &mut settings.suppression_rules {
+            if rule.id == "monitor-sample" && rule.source.as_deref() == Some("monitor") {
+                rule.operation_kind = Some("monitor.sample".into());
+                rule.contains = None;
+            }
+        }
+        settings.version = 2;
+    }
+    for rule in &mut settings.suppression_rules {
+        rule.source = rule.source.as_ref().map(|value| value.trim().to_lowercase()).filter(|value| !value.is_empty());
+        rule.host_id = rule.host_id.as_ref().map(|value| value.trim().to_string()).filter(|value| !value.is_empty());
+        rule.operation_kind = rule.operation_kind.as_ref().map(|value| value.trim().to_lowercase()).filter(|value| !value.is_empty());
+        rule.contains = rule.contains.as_ref().map(|value| value.trim().to_lowercase()).filter(|value| !value.is_empty());
+    }
+    settings
 }
 
 #[tauri::command]
 fn settings_get(state: State<'_, AppState>) -> AppResult<AppSettings> {
-    Ok(state.db.setting_get("app")?.and_then(|v| serde_json::from_str(&v).ok()).unwrap_or_else(default_settings))
+    let stored = state.db.setting_get("app")?;
+    let settings = stored.as_deref().and_then(|value| serde_json::from_str(value).ok()).unwrap_or_else(default_settings);
+    let normalized = normalize_settings(settings);
+    // Persist migrations and trimmed rule fields so the same legacy value is not
+    // reinterpreted on every startup.
+    let serialized = serde_json::to_string(&normalized).map_err(|e| AppError::Other(e.to_string()))?;
+    if stored.as_deref() != Some(serialized.as_str()) {
+        state.db.setting_set("app", &serialized)?;
+    }
+    Ok(normalized)
 }
 
 #[tauri::command]
 fn settings_update(state: State<'_, AppState>, settings: AppSettings) -> AppResult<AppSettings> {
+    let settings = normalize_settings(settings);
     let value = serde_json::to_string(&settings).map_err(|e| AppError::Other(e.to_string()))?;
     state.db.setting_set("app", &value)?;
     Ok(settings)
@@ -672,12 +709,24 @@ fn forward_delete(state: State<'_, AppState>, id: String) -> AppResult<()> {
 }
 
 #[tauri::command]
-fn config_export(state: State<'_, AppState>, path: PathBuf) -> AppResult<()> {
-    let hosts = state.db.hosts_list()?;
+fn config_export(state: State<'_, AppState>, path: PathBuf, host_id: Option<String>) -> AppResult<()> {
+    let hosts = if let Some(id) = host_id {
+        vec![state.db.host_get(&id)?]
+    } else {
+        state.db.hosts_list()?
+    };
+    let hosts = hosts.into_iter().map(|host| {
+        let mut value = serde_json::to_value(host).map_err(|error| AppError::Other(error.to_string()))?;
+        if let Some(object) = value.as_object_mut() {
+            object.remove("credentialId");
+            object.insert("status".into(), serde_json::Value::String("disconnected".into()));
+        }
+        Ok::<_, AppError>(value)
+    }).collect::<AppResult<Vec<_>>>()?;
     std::fs::write(
         path,
         serde_json::to_vec_pretty(
-            &serde_json::json!({"version":1,"exportedAt":Utc::now(),"hosts":hosts}),
+            &serde_json::json!({"version":2,"exportedAt":Utc::now(),"hosts":hosts}),
         )
         .map_err(|e| AppError::Other(e.to_string()))?,
     )?;

@@ -67,9 +67,13 @@ impl Database {
         Ok(())
     }
     pub fn host_delete(&self, id: &str) -> AppResult<()> {
-        self.0
-            .lock()
-            .execute("DELETE FROM hosts WHERE id=?1", [id])?;
+        let mut connection = self.0.lock();
+        let transaction = connection.transaction()?;
+        transaction.execute("DELETE FROM forward_profiles WHERE host_id=?1", [id])?;
+        transaction.execute("DELETE FROM known_hosts WHERE host_id=?1", [id])?;
+        transaction.execute("DELETE FROM metrics WHERE host_id=?1", [id])?;
+        transaction.execute("DELETE FROM hosts WHERE id=?1", [id])?;
+        transaction.commit()?;
         Ok(())
     }
     pub fn command_add(&self, record: &CommandRecord) -> AppResult<()> {

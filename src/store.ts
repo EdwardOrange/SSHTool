@@ -21,6 +21,7 @@ interface AppState {
   settings: AppSettings | undefined;
   setHosts: (hosts: HostProfile[]) => void;
   upsertHost: (host: HostProfile) => void;
+  removeHost: (id: string) => void;
   selectHost: (id?: string) => void;
   setPage: (page: PageId) => void;
   addMetric: (snapshot: MetricSnapshot) => void;
@@ -40,6 +41,12 @@ export const useAppStore = create<AppState>((set) => ({
   upsertHost: (host) => set((s) => {
     const normalized = normalizeHost(host);
     return { hosts: s.hosts.some((h) => h.id === normalized.id) ? s.hosts.map((h) => h.id === normalized.id ? normalized : h) : [...s.hosts, normalized], selectedHostId: normalized.id };
+  }),
+  removeHost: (id) => set((s) => {
+    const index = s.hosts.findIndex((host) => host.id === id);
+    const hosts = s.hosts.filter((host) => host.id !== id);
+    const selectedHostId = s.selectedHostId === id ? (hosts[index]?.id || hosts[index - 1]?.id) : s.selectedHostId;
+    return { hosts, selectedHostId };
   }),
   selectHost: (selectedHostId) => set({ selectedHostId }),
   setPage: (page) => set({ page }),

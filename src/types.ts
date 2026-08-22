@@ -162,6 +162,7 @@ export interface CommandSuppressionRule {
   enabled: boolean;
   source?: CommandRecord["source"];
   hostId?: string;
+  operationKind?: string;
   contains?: string;
 }
 

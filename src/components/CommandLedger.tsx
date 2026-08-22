@@ -5,13 +5,14 @@ import React from "react";
 import { useTranslation } from "react-i18next";
 import { api } from "../api";
 import { useAppStore } from "../store";
+import { commandMatchesSuppression } from "../commandSuppression";
 import { formatError, shortTime } from "../utils";
 
 const copyText = async (text: string) => { try { await navigator.clipboard.writeText(text); } catch { const el = document.createElement("textarea"); el.value = text; document.body.appendChild(el); el.select(); document.execCommand("copy"); el.remove(); } };
 
 export default function CommandLedger() {
   const { t } = useTranslation(); const { commands, settings, commandPanelOpen, commandPanelHeight, toggleCommandPanel, setCommandPanelHeight, setCommands } = useAppStore(); const [source, setSource] = React.useState("all"); const [query, setQuery] = React.useState(""); const [expanded, setExpanded] = React.useState<string>(); const [notice, setNotice] = React.useState(""); const dragY = React.useRef<number | undefined>(undefined);
-  const suppressed = (c: typeof commands[number]) => settings?.suppressionRules.some((r) => r.enabled && (!r.source || r.source === c.source) && (!r.hostId || r.hostId === c.hostId) && (!r.contains || c.command.toLowerCase().includes(r.contains.toLowerCase()))) || (c.source === "monitor" && c.operationKind === "monitor.sample");
+  const suppressed = (c: typeof commands[number]) => settings?.suppressionRules.some((rule) => commandMatchesSuppression(c, rule)) || false;
   const filtered = commands.filter((c) => !suppressed(c) && (source === "all" || c.source === source) && `${c.command} ${c.stdout} ${c.stderr} ${c.hostName}`.toLowerCase().includes(query.toLowerCase()));
   React.useEffect(() => { const move = (e: MouseEvent) => { if (dragY.current !== undefined) setCommandPanelHeight(Math.max(140, Math.min(500, window.innerHeight - e.clientY))); }; const up = () => { dragY.current = undefined; }; window.addEventListener("mousemove", move); window.addEventListener("mouseup", up); return () => { window.removeEventListener("mousemove", move); window.removeEventListener("mouseup", up); }; }, [setCommandPanelHeight]);
   const copyAll = () => copyText(filtered.map((c) => `[${c.timestamp}] ${c.hostName || "local"} $ ${c.command}\n${c.stdout}${c.stderr}`).join("\n")).then(() => { setNotice("已复制"); setTimeout(() => setNotice(""), 1200); });
