@@ -22,9 +22,9 @@ const pages: { id: PageId; label: string }[] = [
   { id: "terminal", label: "terminal" }, { id: "monitor", label: "monitor" }, { id: "firewall", label: "firewall" }, { id: "sftp", label: "sftp" }, { id: "forwarding", label: "forwarding" },
 ];
 
-export default function App({ mode, toggleMode }: { mode: "light" | "dark"; toggleMode: () => void }) {
+export default function App({ mode, toggleMode, setMode }: { mode: "light" | "dark"; toggleMode: () => void; setMode: React.Dispatch<React.SetStateAction<"light" | "dark">> }) {
   const { t, i18n } = useTranslation();
-  const { hosts, setHosts, selectedHostId, page, setPage, upsertHost, removeHost, setCommands, addCommand, setSettings } = useAppStore();
+  const { hosts, setHosts, selectedHostId, page, setPage, upsertHost, removeHost, setCommands, addCommand, setSettings, settings } = useAppStore();
   const [loading, setLoading] = React.useState(true);
   const [startupError, setStartupError] = React.useState("");
   const [hostDialog, setHostDialog] = React.useState(false);
@@ -35,6 +35,15 @@ export default function App({ mode, toggleMode }: { mode: "light" | "dark"; togg
   const [confirmAction, setConfirmAction] = React.useState<{ kind: "edit" | "delete"; host: HostProfile } | null>(null);
   const [notice, setNotice] = React.useState("");
   const host = hosts.find((item) => item.id === selectedHostId);
+
+  React.useEffect(() => {
+    if (settings?.theme !== "system") return;
+    const media = window.matchMedia("(prefers-color-scheme: dark)");
+    const apply = () => setMode(media.matches ? "dark" : "light");
+    apply();
+    media.addEventListener("change", apply);
+    return () => media.removeEventListener("change", apply);
+  }, [setMode, settings?.theme]);
 
   React.useEffect(() => {
     let alive = true;
@@ -57,8 +66,23 @@ export default function App({ mode, toggleMode }: { mode: "light" | "dark"; togg
     setConnecting(true);
     try {
       if (host.status === "connected") { await api.sshDisconnect(host.id); upsertHost({ ...host, status: "disconnected" }); }
-      else { await api.sshConnect(host.id); upsertHost({ ...host, status: "connected", lastConnectedAt: new Date().toISOString() }); }
-    } catch { upsertHost({ ...host, status: "error" }); }
+      else {
+        let password: string | undefined;
+        if ((host.authMethod === "password" || host.authMethod === "keyboardInteractive") && !host.credentialId) {
+          password = window.prompt(`请输入 ${host.name} 的 SSH 密码`) || undefined;
+          if (!password) return;
+        }
+        try {
+          await api.sshConnect(host.id, password);
+        } catch (firstError) {
+          const fingerprint = await api.sshHostKeyPending(host.id);
+          if (!fingerprint || !window.confirm(`首次连接或主机密钥已变化。\n\n主机：${host.hostname}:${host.port}\n指纹：${fingerprint}\n\n仅在你已通过可信渠道核对指纹后继续。`)) throw firstError;
+          await api.sshTrustHostKey(host.id, fingerprint);
+          await api.sshConnect(host.id, password);
+        }
+        upsertHost({ ...host, status: "connected", lastConnectedAt: new Date().toISOString() });
+      }
+    } catch (error) { upsertHost({ ...host, status: "error" }); setNotice(formatError(error)); }
     finally { setConnecting(false); }
   };
 
@@ -125,7 +149,7 @@ export default function App({ mode, toggleMode }: { mode: "light" | "dark"; togg
       <DialogActions><Button onClick={() => setConfirmAction(null)}>取消</Button><Button color={confirmAction?.kind === "delete" ? "error" : "primary"} variant="contained" onClick={() => void executeConfirmedAction()}>{confirmAction?.kind === "delete" ? "确认删除" : "断开并编辑"}</Button></DialogActions>
     </Dialog>
     <Snackbar open={Boolean(notice)} autoHideDuration={3500} onClose={() => setNotice("")}><Alert severity="info" onClose={() => setNotice("")}>{notice}</Alert></Snackbar>
-    <SettingsView open={settingsOpen} onClose={() => setSettingsOpen(false)} onTheme={(theme) => { if (theme !== "system" && ((theme === "dark") !== (mode === "dark"))) toggleMode(); }}/>
+    <SettingsView open={settingsOpen} onClose={() => setSettingsOpen(false)} onTheme={(theme) => { const next = theme === "system" ? (window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light") : theme; localStorage.setItem("theme", next); setMode(next); }}/>
   </Box>;
 }
 

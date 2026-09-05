@@ -10,16 +10,16 @@ import { formatBytes, formatDuration, shortTime } from "../utils";
 const EMPTY_METRICS: MetricSnapshot[] = [];
 
 export default function MonitorView({ host }: { host: HostProfile }) {
-  const theme = useTheme(); const addMetric = useAppStore((s) => s.addMetric); const points = useAppStore((s) => s.metrics[host.id] ?? EMPTY_METRICS); const current = points.at(-1);
+  const theme = useTheme(); const addMetric = useAppStore((s) => s.addMetric); const interval = useAppStore((s) => s.settings?.monitorIntervalSeconds ?? 2); const points = useAppStore((s) => s.metrics[host.id] ?? EMPTY_METRICS); const current = points.at(-1);
   React.useEffect(() => {
     if (host.status !== "connected") return;
     let alive = true;
-    api.monitorStart(host.id, (e) => alive && addMetric(e.payload)).catch(() => undefined);
+    api.monitorStart(host.id, (e) => alive && addMetric(e.payload), interval).catch(() => undefined);
     return () => {
       alive = false;
       void api.monitorStop(host.id).catch(() => undefined);
     };
-  }, [host.id, host.status, addMetric]);
+  }, [host.id, host.status, addMetric, interval]);
   if (host.status !== "connected") {
     return <Box sx={{ height: "100%", display: "grid", placeItems: "center" }}>
       <Paper variant="outlined" sx={{ maxWidth: 520, p: 4, textAlign: "center" }}>
@@ -33,7 +33,7 @@ export default function MonitorView({ host }: { host: HostProfile }) {
   }
   const graphData = points.slice(-60).map((p) => ({ ...p, time: shortTime(p.timestamp), rx: p.rxBytesPerSec / 1_000_000, tx: p.txBytesPerSec / 1_000_000 }));
   return <Box sx={{ overflowY: "auto", height: "100%", pr: .5 }}>
-    <Stack direction="row" alignItems="center" spacing={1} sx={{ mb: 2 }}><Typography variant="h6">{host.name} · 资源监控</Typography><Chip size="small" color="success" icon={<Circle className="live-dot" sx={{ fontSize: "8px!important" }} />} label="2 秒实时" variant="outlined" /><Box sx={{ flex: 1 }} />{current && <Stack direction="row" alignItems="center" spacing={.5}><ScheduleRounded fontSize="small" color="disabled" /><Typography variant="caption" color="text.secondary">运行 {formatDuration(current.uptimeSeconds)}</Typography></Stack>}</Stack>
+    <Stack direction="row" alignItems="center" spacing={1} sx={{ mb: 2 }}><Typography variant="h6">{host.name} · 资源监控</Typography><Chip size="small" color="success" icon={<Circle className="live-dot" sx={{ fontSize: "8px!important" }} />} label={`${interval} 秒实时`} variant="outlined" /><Box sx={{ flex: 1 }} />{current && <Stack direction="row" alignItems="center" spacing={.5}><ScheduleRounded fontSize="small" color="disabled" /><Typography variant="caption" color="text.secondary">运行 {formatDuration(current.uptimeSeconds)}</Typography></Stack>}</Stack>
     <Stack direction={{ xs: "column", md: "row" }} spacing={1.5}>{[
       ["CPU", current?.cpuPercent || 0, `${(current?.load1 || 0).toFixed(2)} load`, "#5B8DEF"],
       ["内存", current?.memoryPercent || 0, current ? `${formatBytes(current.memoryUsedBytes)} / ${formatBytes(current.memoryTotalBytes)}` : "—", "#8B6CE7"],

@@ -17,7 +17,7 @@ function Root() {
   const [mode, setMode] = React.useState<"light" | "dark">(() => (localStorage.getItem("theme") as "light" | "dark") || (prefersDark ? "dark" : "light"));
   const theme = React.useMemo(() => buildTheme(mode), [mode]);
   const toggle = () => setMode((value) => { const next = value === "dark" ? "light" : "dark"; localStorage.setItem("theme", next); return next; });
-  return <ThemeProvider theme={theme}><CssBaseline /><App mode={mode} toggleMode={toggle} /></ThemeProvider>;
+  return <ThemeProvider theme={theme}><CssBaseline /><App mode={mode} toggleMode={toggle} setMode={setMode} /></ThemeProvider>;
 }
 
 // A terminal session is an external, stateful resource. React StrictMode intentionally

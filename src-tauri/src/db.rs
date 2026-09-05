@@ -22,9 +22,13 @@ impl Database {
             CREATE TABLE IF NOT EXISTS metrics (host_id TEXT NOT NULL, timestamp TEXT NOT NULL, resolution INTEGER NOT NULL DEFAULT 2, data TEXT NOT NULL, PRIMARY KEY(host_id,timestamp,resolution));
             CREATE INDEX IF NOT EXISTS idx_metrics_query ON metrics(host_id,resolution,timestamp);
             CREATE TABLE IF NOT EXISTS forward_profiles (id TEXT PRIMARY KEY, host_id TEXT NOT NULL, data TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS known_hosts (host_id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, updated_at TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS known_hosts (host_id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, endpoint TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
         "#)?;
+        // Legacy databases did not scope trust to the actual network endpoint.
+        // Keep those records for migration, but do not use them until the
+        // endpoint has been explicitly confirmed again.
+        let _ = connection.execute("ALTER TABLE known_hosts ADD COLUMN endpoint TEXT NOT NULL DEFAULT ''", []);
         Ok(Self(Mutex::new(connection)))
     }
 
@@ -66,6 +70,16 @@ impl Database {
         self.0.lock().execute("INSERT INTO hosts(id,data,created_at,updated_at) VALUES(?1,?2,?3,?4) ON CONFLICT(id) DO UPDATE SET data=excluded.data,updated_at=excluded.updated_at", params![host.id,data,host.created_at,host.updated_at])?;
         Ok(())
     }
+    pub fn hosts_upsert(&self, hosts: &[HostProfile]) -> AppResult<()> {
+        let mut connection = self.0.lock();
+        let transaction = connection.transaction()?;
+        for host in hosts {
+            let data = serde_json::to_string(host).map_err(|e| AppError::Other(e.to_string()))?;
+            transaction.execute("INSERT INTO hosts(id,data,created_at,updated_at) VALUES(?1,?2,?3,?4) ON CONFLICT(id) DO UPDATE SET data=excluded.data,updated_at=excluded.updated_at", params![host.id, data, host.created_at, host.updated_at])?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
     pub fn host_delete(&self, id: &str) -> AppResult<()> {
         let mut connection = self.0.lock();
         let transaction = connection.transaction()?;
@@ -83,10 +97,10 @@ impl Database {
             "INSERT OR REPLACE INTO command_log(id,host_id,timestamp,data) VALUES(?1,?2,?3,?4)",
             params![record.id, record.host_id, record.timestamp, data],
         )?;
-        let retention_days: i64 = connection.query_row("SELECT COALESCE(json_extract(value, '$.commandRetentionDays'), 7) FROM settings WHERE key='app'", [], |row| row.get(0)).unwrap_or(7);
-        connection.execute("DELETE FROM command_log WHERE timestamp < datetime('now', '-' || ?1 || ' days')", [retention_days])?;
-        let retention_mb: i64 = connection.query_row("SELECT COALESCE(json_extract(value, '$.commandRetentionMb'), 100) FROM settings WHERE key='app'", [], |row| row.get(0)).unwrap_or(100);
-        while connection.query_row::<i64, _, _>("SELECT COALESCE(SUM(length(data)),0) FROM command_log", [], |row| row.get(0)).unwrap_or(0) > retention_mb * 1024 * 1024 {
+        let retention_days: i64 = connection.query_row("SELECT COALESCE(json_extract(value, '$.commandRetentionDays'), 7) FROM settings WHERE key='app'", [], |row| row.get(0)).unwrap_or(7).clamp(1, 3650);
+        connection.execute("DELETE FROM command_log WHERE julianday(timestamp) < julianday('now', '-' || ?1 || ' days')", [retention_days])?;
+        let retention_mb: i64 = connection.query_row("SELECT COALESCE(json_extract(value, '$.commandRetentionMb'), 100) FROM settings WHERE key='app'", [], |row| row.get(0)).unwrap_or(100).clamp(10, 10_000);
+        while connection.query_row::<i64, _, _>("SELECT COALESCE(SUM(length(CAST(data AS BLOB))),0) FROM command_log", [], |row| row.get(0)).unwrap_or(0) > retention_mb * 1024 * 1024 {
             connection.execute("DELETE FROM command_log WHERE id=(SELECT id FROM command_log ORDER BY timestamp ASC LIMIT 1)", [])?;
         }
         Ok(())
@@ -145,7 +159,7 @@ impl Database {
             "INSERT OR REPLACE INTO metrics(host_id,timestamp,resolution,data) VALUES(?1,?2,?3,?4)",
             params![metric.host_id, metric.timestamp, resolution, data],
         )?;
-        c.execute("DELETE FROM metrics WHERE (resolution=2 AND timestamp<datetime('now','-1 hour')) OR (resolution=60 AND timestamp<datetime('now','-1 day')) OR (resolution=300 AND timestamp<datetime('now','-7 days'))",[])?;
+        c.execute("DELETE FROM metrics WHERE (resolution IN (2,5,10,30) AND julianday(timestamp)<julianday('now','-1 hour')) OR (resolution=60 AND julianday(timestamp)<julianday('now','-1 day')) OR (resolution=300 AND julianday(timestamp)<julianday('now','-7 days'))",[])?;
         Ok(())
     }
     pub fn metrics(&self, host_id: &str, since: &str) -> AppResult<Vec<MetricSnapshot>> {
@@ -181,19 +195,19 @@ impl Database {
             .execute("DELETE FROM forward_profiles WHERE id=?1", [id])?;
         Ok(())
     }
-    pub fn known_fingerprint(&self, host_id: &str) -> AppResult<Option<String>> {
+    pub fn known_fingerprint(&self, host_id: &str, endpoint: &str) -> AppResult<Option<String>> {
         Ok(self
             .0
             .lock()
             .query_row(
-                "SELECT fingerprint FROM known_hosts WHERE host_id=?1",
-                [host_id],
+                "SELECT fingerprint FROM known_hosts WHERE host_id=?1 AND endpoint=?2",
+                params![host_id, endpoint],
                 |r| r.get(0),
             )
             .optional()?)
     }
-    pub fn set_fingerprint(&self, host_id: &str, fingerprint: &str) -> AppResult<()> {
-        self.0.lock().execute("INSERT INTO known_hosts(host_id,fingerprint,updated_at) VALUES(?1,?2,datetime('now')) ON CONFLICT(host_id) DO UPDATE SET fingerprint=excluded.fingerprint,updated_at=excluded.updated_at",params![host_id,fingerprint])?;
+    pub fn set_fingerprint(&self, host_id: &str, endpoint: &str, fingerprint: &str) -> AppResult<()> {
+        self.0.lock().execute("INSERT INTO known_hosts(host_id,fingerprint,endpoint,updated_at) VALUES(?1,?2,?3,datetime('now')) ON CONFLICT(host_id) DO UPDATE SET fingerprint=excluded.fingerprint,endpoint=excluded.endpoint,updated_at=excluded.updated_at",params![host_id,fingerprint,endpoint])?;
         Ok(())
     }
 }

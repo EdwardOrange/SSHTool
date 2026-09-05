@@ -190,6 +190,7 @@ pub struct FirewallPlan {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
 pub struct FirewallApplyProgress {
     pub plan_id: String,
     pub phase: String,

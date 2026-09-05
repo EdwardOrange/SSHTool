@@ -26,11 +26,11 @@ export default function SettingsView({ open, onClose, onTheme }: SettingsViewPro
   const closeRequested = React.useRef(false);
   const saveChain = React.useRef<Promise<unknown>>(Promise.resolve());
 
-  const finishWrite = () => {
+  const finishWrite = (success = true) => {
     pendingWrites.current = Math.max(0, pendingWrites.current - 1);
     if (pendingWrites.current === 0) {
       setSaving(false);
-      setSaved(true);
+      if (success) setSaved(true);
       window.setTimeout(() => setSaved(false), 1200);
       if (closeRequested.current) {
         closeRequested.current = false;
@@ -46,8 +46,7 @@ export default function SettingsView({ open, onClose, onTheme }: SettingsViewPro
     saveChain.current = saveChain.current
       .catch(() => undefined)
       .then(() => api.settingsUpdate(next))
-      .catch((reason) => setError(formatError(reason)))
-      .finally(finishWrite);
+      .then(() => finishWrite(true), (reason) => { setError(formatError(reason)); finishWrite(false); });
   };
 
   const update = (patch: Partial<AppSettings>) => {
@@ -80,8 +79,7 @@ export default function SettingsView({ open, onClose, onTheme }: SettingsViewPro
         onTheme(next.theme);
         void i18n.changeLanguage(next.locale);
       })
-      .catch((reason) => setError(formatError(reason)))
-      .finally(finishWrite);
+      .then(() => finishWrite(true), (reason) => { setError(formatError(reason)); finishWrite(false); });
   };
 
   return <Dialog open={open} onClose={requestClose} fullWidth maxWidth="md" slotProps={{ paper: { sx: { width: 860, maxHeight: "80vh", borderRadius: 3 } } }}>

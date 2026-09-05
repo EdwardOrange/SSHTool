@@ -50,6 +50,7 @@ impl MonitorManager {
         ssh: Arc<SshManager>,
         db: Arc<Database>,
         channel: Channel<StreamEnvelope<MetricSnapshot>>,
+        interval_seconds: u64,
     ) -> AppResult<String> {
         self.stop(&host_id);
         let (cancel_tx, mut cancel_rx) = watch::channel(false);
@@ -62,11 +63,11 @@ impl MonitorManager {
         // through Tauri's global async runtime so opening the monitor page can
         // never panic the desktop process.
         tauri::async_runtime::spawn(async move {
-            let mut ticker = tokio::time::interval(Duration::from_secs(2));
+            let mut ticker = tokio::time::interval(Duration::from_secs(interval_seconds.clamp(1, 300)));
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 tokio::select! { _=ticker.tick()=>{
-                    let started=chrono::Utc::now(); match ssh.exec(&host_id,SAMPLE_COMMAND).await { Ok(output)=>{ if let Ok(snapshot)=parse_snapshot(&host_id,&output.stdout,&previous){ let _=db.metric_add(&snapshot,2); let _=db.command_add(&CommandRecord{id:uuid::Uuid::new_v4().to_string(),timestamp:started.to_rfc3339(),host_id:Some(host_id.clone()),host_name:ssh.profile(&host_id).ok().map(|h|h.name),source:"monitor".into(),command:redact(SAMPLE_COMMAND),stdout:"采样完成".into(),stderr:redact(&output.stderr),exit_code:Some(output.exit_code),duration_ms:output.duration_ms,status:if output.exit_code==0{"success".into()}else{"error".into()},repeat_count:1,equivalent:None,operation_kind:Some("monitor.sample".into())}); let _=channel.send(StreamEnvelope{seq:sequence.fetch_add(1,Ordering::Relaxed),timestamp:snapshot.timestamp.clone(),host_id:host_id.clone(),session_id:None,payload:snapshot}); } }, Err(_)=>{} }
+                    let started=chrono::Utc::now(); match ssh.exec(&host_id,SAMPLE_COMMAND).await { Ok(output)=>{ if let Ok(snapshot)=parse_snapshot(&host_id,&output.stdout,&previous){ let _=db.metric_add(&snapshot,interval_seconds as u32); let _=db.command_add(&CommandRecord{id:uuid::Uuid::new_v4().to_string(),timestamp:started.to_rfc3339(),host_id:Some(host_id.clone()),host_name:ssh.profile(&host_id).ok().map(|h|h.name),source:"monitor".into(),command:redact(SAMPLE_COMMAND),stdout:"采样完成".into(),stderr:redact(&output.stderr),exit_code:Some(output.exit_code),duration_ms:output.duration_ms,status:if output.exit_code==0{"success".into()}else{"error".into()},repeat_count:1,equivalent:None,operation_kind:Some("monitor.sample".into())}); let _=channel.send(StreamEnvelope{seq:sequence.fetch_add(1,Ordering::Relaxed),timestamp:snapshot.timestamp.clone(),host_id:host_id.clone(),session_id:None,payload:snapshot}); } }, Err(error)=>{ let _=db.command_add(&CommandRecord{id:uuid::Uuid::new_v4().to_string(),timestamp:started.to_rfc3339(),host_id:Some(host_id.clone()),host_name:ssh.profile(&host_id).ok().map(|h|h.name),source:"monitor".into(),command:redact(SAMPLE_COMMAND),stdout:String::new(),stderr:redact(&error.to_string()),exit_code:None,duration_ms:0,status:"error".into(),repeat_count:1,equivalent:None,operation_kind:Some("monitor.sample".into())}); } }
                 }, _=cancel_rx.changed()=>break }
             }
         });
@@ -164,7 +165,7 @@ fn parse_snapshot(
     let cpu_percent = if old.total == 0 || total_delta == 0 {
         0.0
     } else {
-        100.0 * (total_delta - idle_delta) as f64 / total_delta as f64
+        100.0 * total_delta.saturating_sub(idle_delta) as f64 / total_delta as f64
     };
     let seconds = ((now_ms - old.timestamp_ms) as f64 / 1000.0).max(0.1);
     let rx_rate = if old.timestamp_ms == 0 {
@@ -184,7 +185,7 @@ fn parse_snapshot(
         timestamp: now.to_rfc3339(),
         cpu_percent,
         memory_percent: if mem_total > 0 {
-            100.0 * (mem_total - mem_available) as f64 / mem_total as f64
+            100.0 * mem_total.saturating_sub(mem_available) as f64 / mem_total as f64
         } else {
             0.0
         },
@@ -196,8 +197,8 @@ fn parse_snapshot(
         load1,
         rx_bytes_per_sec: rx_rate,
         tx_bytes_per_sec: tx_rate,
-        connection_count: connections.len() as u32,
-        memory_used_bytes: mem_total - mem_available,
+        connection_count: connections.len().min(u32::MAX as usize) as u32,
+        memory_used_bytes: mem_total.saturating_sub(mem_available),
         memory_total_bytes: mem_total,
         disk_used_bytes: disk_used,
         disk_total_bytes: disk_total,

@@ -1,5 +1,5 @@
 import { invoke, Channel } from "@tauri-apps/api/core";
-import type { AppSettings, CommandRecord, CommandSuppressionRule, FirewallPlan, FirewallRuleInput, FirewallState, ForwardingProfile, HostDraft, HostProfile, MetricSnapshot, SftpEntry, StreamEnvelope, TransferProgress } from "./types";
+import type { AppSettings, CommandRecord, CommandSuppressionRule, FirewallApplyResult, FirewallPlan, FirewallRuleInput, FirewallState, ForwardingProfile, HostDraft, HostProfile, MetricSnapshot, SftpEntry, StreamEnvelope, TransferProgress } from "./types";
 
 const isTauri = () => "__TAURI_INTERNALS__" in window;
 const now = () => new Date().toISOString();
@@ -23,6 +23,8 @@ export const api = {
   },
   async hostsDelete(id: string) { if (isTauri()) await invoke("hosts_delete", { id }); else mockHosts = mockHosts.filter((h) => h.id !== id); },
   async sshConnect(hostId: string, password?: string) { if (isTauri()) return invoke("ssh_connect", { hostId, password }); await new Promise((r) => setTimeout(r, 500)); },
+  async sshHostKeyPending(hostId: string): Promise<string | null> { return isTauri() ? invoke("ssh_host_key_pending", { hostId }) : null; },
+  async sshTrustHostKey(hostId: string, fingerprint: string): Promise<void> { if (isTauri()) await invoke("ssh_trust_host_key", { hostId, fingerprint }); },
   async sshDisconnect(hostId: string) { if (isTauri()) await invoke("ssh_disconnect", { hostId }); },
   async terminalOpen(hostId: string, cols: number, rows: number, commandLogging: boolean, onData: (data: StreamEnvelope<number[]>) => void): Promise<string> {
     if (!isTauri()) { setTimeout(() => onData({ seq: 1, timestamp: now(), hostId, sessionId: "demo-term", payload: Array.from(new TextEncoder().encode("\x1b[1;34mSSH Operations Terminal\x1b[0m\r\nConnected to demo server.\r\n\x1b[32mops@server\x1b[0m:\x1b[34m~\x1b[0m$ ")) }), 180); return "demo-term"; }
@@ -32,17 +34,17 @@ export const api = {
   async terminalInput(sessionId: string, data: number[]) { if (isTauri()) await invoke("terminal_input", { sessionId, data }); },
   async terminalResize(sessionId: string, cols: number, rows: number) { if (isTauri()) await invoke("terminal_resize", { sessionId, cols, rows }); },
   async terminalClose(sessionId: string) { if (isTauri()) await invoke("terminal_close", { sessionId }); },
-  async monitorStart(hostId: string, onData: (data: StreamEnvelope<MetricSnapshot>) => void): Promise<string> {
+  async monitorStart(hostId: string, onData: (data: StreamEnvelope<MetricSnapshot>) => void, intervalSeconds = 2): Promise<string> {
     if (!isTauri()) {
       const timer = window.setInterval(() => {
         const t = Date.now() / 1000;
         const snapshot: MetricSnapshot = { hostId, timestamp: now(), cpuPercent: 28 + Math.sin(t / 3) * 12 + Math.random() * 5, memoryPercent: 62 + Math.sin(t / 8) * 3, diskPercent: 48.7, load1: 1.35 + Math.sin(t / 5) * .35, rxBytesPerSec: 1_400_000 + Math.random() * 2_500_000, txBytesPerSec: 620_000 + Math.random() * 1_100_000, connectionCount: 42 + Math.floor(Math.random() * 8), memoryUsedBytes: 10_650_000_000, memoryTotalBytes: 17_180_000_000, diskUsedBytes: 128_000_000_000, diskTotalBytes: 256_000_000_000, uptimeSeconds: 1_248_320, connections: [{ protocol: "tcp", state: "ESTAB", localAddress: "10.0.1.12:22", remoteAddress: "10.0.0.42:54218", process: "sshd" }, { protocol: "tcp", state: "ESTAB", localAddress: "10.0.1.12:443", remoteAddress: "172.16.1.18:39120", process: "nginx" }], topProcesses: [{ pid: 1428, name: "postgres", cpuPercent: 8.7, memoryPercent: 12.4 }, { pid: 918, name: "nginx", cpuPercent: 4.2, memoryPercent: 2.1 }, { pid: 2001, name: "node", cpuPercent: 3.8, memoryPercent: 5.7 }] };
         onData({ seq: Date.now(), timestamp: now(), hostId, payload: snapshot });
-      }, 2000);
+      }, intervalSeconds * 1000);
       return String(timer);
     }
     const channel = new Channel<StreamEnvelope<MetricSnapshot>>(); channel.onmessage = onData;
-    return invoke("monitor_start", { hostId, channel });
+    return invoke("monitor_start", { hostId, channel, intervalSeconds });
   },
   async monitorStop(hostId: string) { if (isTauri()) await invoke("monitor_stop", { hostId }); },
   async monitorQuery(hostId: string, range: string) { return isTauri() ? invoke<MetricSnapshot[]>("monitor_query", { hostId, range }) : []; },
@@ -58,9 +60,9 @@ export const api = {
     if (isTauri()) return invoke("firewall_plan", { hostId, change: { operation, rule } });
     return { id: crypto.randomUUID(), hostId, stateHash: "demo-hash", summary: `允许 ${rule.protocol.toUpperCase()} ${rule.ports}`, commands: [`sudo ufw allow proto ${rule.protocol} from ${rule.source} to any port ${rule.ports} comment '${rule.comment}'`], warnings: ["将先创建 60 秒自动回滚任务，并验证新的 SSH 连接。"], risk: "medium", rollbackAvailable: true, expiresAt: new Date(Date.now() + 300_000).toISOString() };
   },
-  async firewallApply(planId: string, sudoPassword?: string, rememberSudo = false) { return isTauri() ? invoke("firewall_apply", { planId, sudoPassword: sudoPassword || null, rememberSudo }) : { rollbackDeadline: new Date(Date.now() + 60_000).toISOString() }; },
-  async firewallCommit(planId: string) { if (isTauri()) await invoke("firewall_commit", { planId }); },
-  async firewallRollback(planId: string) { if (isTauri()) await invoke("firewall_rollback", { planId }); },
+  async firewallApply(planId: string, sudoPassword?: string, rememberSudo = false): Promise<FirewallApplyResult> { return isTauri() ? invoke("firewall_apply", { planId, sudoPassword: sudoPassword || null, rememberSudo }) : { rollbackDeadline: new Date(Date.now() + 60_000).toISOString(), verified: true }; },
+  async firewallCommit(planId: string, sudoPassword?: string) { if (isTauri()) await invoke("firewall_commit", { planId, sudoPassword: sudoPassword || null }); },
+  async firewallRollback(planId: string, sudoPassword?: string) { if (isTauri()) await invoke("firewall_rollback", { planId, sudoPassword: sudoPassword || null }); },
   async commandLogQuery(hostId?: string): Promise<CommandRecord[]> { return isTauri() ? invoke("command_log_query", { hostId: hostId || null }) : []; },
   async commandLogSubscribe(onData: (event: StreamEnvelope<CommandRecord>) => void): Promise<void> {
     if (!isTauri()) return;
@@ -69,7 +71,7 @@ export const api = {
   },
   async commandLogExport(path: string, hostId?: string, records?: CommandRecord[]): Promise<void> {
     if (!isTauri()) { const text = (records || []).map((r) => `[${r.timestamp}] ${r.hostName || "local"} $ ${r.command}\n${r.stdout}${r.stderr}`).join("\n"); const blob = new Blob([text], { type: "text/plain" }); const url = URL.createObjectURL(blob); const a = document.createElement("a"); a.href = url; a.download = path || "command-log.txt"; a.click(); URL.revokeObjectURL(url); return; }
-    await invoke("command_log_export", { path, hostId: hostId || null });
+    await invoke("command_log_export", { path, hostId: hostId || null, records: records || null });
   },
   async commandLogClear(): Promise<void> { if (isTauri()) await invoke("command_log_clear"); },
   async configExport(path: string, hostId?: string): Promise<void> { if (isTauri()) await invoke("config_export", { path, hostId: hostId || null }); else { const host = mockHosts.find((item) => item.id === hostId); const blob = new Blob([JSON.stringify({ version: 2, hosts: host ? [{ ...host, credentialId: undefined, status: "disconnected" }] : mockHosts.map((item) => ({ ...item, credentialId: undefined, status: "disconnected" })) }, null, 2)], { type: "application/json" }); const url = URL.createObjectURL(blob); const anchor = document.createElement("a"); anchor.href = url; anchor.download = path || "ssh-config.json"; anchor.click(); URL.revokeObjectURL(url); } },

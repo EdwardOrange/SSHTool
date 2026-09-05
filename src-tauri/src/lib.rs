@@ -108,6 +108,11 @@ fn hosts_upsert(state: State<'_, AppState>, draft: HostDraft) -> AppResult<HostP
     let now = Utc::now().to_rfc3339();
     let id = draft.id.unwrap_or_else(|| Uuid::new_v4().to_string());
     let existing = state.db.host_get(&id).ok();
+    let endpoint_changed = existing.as_ref().is_some_and(|host| host.hostname != draft.hostname.trim() || host.port != draft.port);
+    if endpoint_changed && state.ssh.is_connected(&id) {
+        return Err(AppError::Validation("修改已连接服务器的地址或端口前请先断开连接".into()));
+    }
+    let host_key_fingerprint = if endpoint_changed { None } else { draft.host_key_fingerprint.or_else(|| existing.as_ref().and_then(|host| host.host_key_fingerprint.clone())) };
     let old_credential_id = existing.as_ref().and_then(|host| host.credential_id.clone());
     let mut credential_id = draft
         .credential_id
@@ -135,7 +140,7 @@ fn hosts_upsert(state: State<'_, AppState>, draft: HostDraft) -> AppResult<HostP
         credential_id,
         private_key_path: draft.private_key_path,
         jump_hosts: draft.jump_hosts.unwrap_or_default(),
-        host_key_fingerprint: draft.host_key_fingerprint,
+        host_key_fingerprint,
         status: if state.ssh.is_connected(&id) {
             "connected".into()
         } else {
@@ -163,6 +168,7 @@ async fn hosts_delete(state: State<'_, AppState>, id: String) -> AppResult<()> {
     let _ = state.ssh.disconnect(&id).await;
     state.db.host_delete(&id)?;
     if let Some(cid) = credential_id { let _ = security::delete_secret(&cid); }
+    let _ = security::delete_secret(&format!("sudo:{id}"));
     Ok(())
 }
 #[tauri::command]
@@ -224,6 +230,16 @@ async fn ssh_connect(
     emit_command(&state, record);
     result
 }
+
+#[tauri::command]
+fn ssh_host_key_pending(state: State<'_, AppState>, host_id: String) -> Option<String> {
+    state.ssh.pending_host_key(&host_id)
+}
+
+#[tauri::command]
+fn ssh_trust_host_key(state: State<'_, AppState>, host_id: String, fingerprint: String) -> AppResult<()> {
+    state.ssh.trust_host_key(&state.db, &host_id, &fingerprint)
+}
 #[tauri::command]
 async fn ssh_disconnect(state: State<'_, AppState>, host_id: String) -> AppResult<()> {
     state.monitor.stop(&host_id);
@@ -283,13 +299,14 @@ fn monitor_start(
     state: State<'_, AppState>,
     host_id: String,
     channel: Channel<StreamEnvelope<MetricSnapshot>>,
+    interval_seconds: Option<u32>,
 ) -> AppResult<String> {
     if !state.ssh.is_connected(&host_id) {
         return Err(AppError::Validation("服务器尚未建立 SSH 连接".into()));
     }
     state
         .monitor
-        .start(host_id, state.ssh.clone(), state.db.clone(), channel)
+        .start(host_id, state.ssh.clone(), state.db.clone(), channel, interval_seconds.unwrap_or(2) as u64)
 }
 #[tauri::command]
 fn monitor_stop(state: State<'_, AppState>, host_id: String) {
@@ -329,7 +346,7 @@ async fn firewall_apply(
     plan_id: String,
     sudo_password: Option<String>,
     remember_sudo: Option<bool>,
-) -> AppResult<serde_json::Value> {
+) -> AppResult<FirewallApplyResult> {
     let host_id = state.firewall.plan_host(&plan_id);
     let remembered = if sudo_password.is_none() { host_id.as_deref().and_then(|id| security::read_secret(&format!("sudo:{id}")).ok()) } else { None };
     let effective_password = sudo_password.or(remembered);
@@ -344,12 +361,18 @@ async fn firewall_apply(
     result
 }
 #[tauri::command]
-async fn firewall_commit(state: State<'_, AppState>, plan_id: String) -> AppResult<()> {
-    state.firewall.commit(&state.ssh, &plan_id).await
+async fn firewall_commit(state: State<'_, AppState>, plan_id: String, sudo_password: Option<String>) -> AppResult<()> {
+    let host_id = state.firewall.plan_host(&plan_id);
+    let remembered = if sudo_password.is_none() { host_id.as_deref().and_then(|id| security::read_secret(&format!("sudo:{id}")).ok()) } else { None };
+    let effective_password = sudo_password.or(remembered);
+    state.firewall.commit(&state.ssh, &plan_id, effective_password.as_deref()).await
 }
 #[tauri::command]
-async fn firewall_rollback(state: State<'_, AppState>, plan_id: String) -> AppResult<()> {
-    state.firewall.rollback(&state.ssh, &plan_id).await
+async fn firewall_rollback(state: State<'_, AppState>, plan_id: String, sudo_password: Option<String>) -> AppResult<()> {
+    let host_id = state.firewall.plan_host(&plan_id);
+    let remembered = if sudo_password.is_none() { host_id.as_deref().and_then(|id| security::read_secret(&format!("sudo:{id}")).ok()) } else { None };
+    let effective_password = sudo_password.or(remembered);
+    state.firewall.rollback(&state.ssh, &plan_id, effective_password.as_deref()).await
 }
 
 #[tauri::command]
@@ -403,7 +426,18 @@ fn default_settings() -> AppSettings {
 }
 
 fn normalize_settings(mut settings: AppSettings) -> AppSettings {
-    if settings.version < 2 {
+    let previous_version = settings.version;
+    settings.version = 2;
+    if !matches!(settings.locale.as_str(), "zh" | "en") { settings.locale = "zh".into(); }
+    if !matches!(settings.theme.as_str(), "system" | "light" | "dark") { settings.theme = "system".into(); }
+    if !matches!(settings.default_page.as_str(), "terminal" | "monitor" | "firewall" | "sftp" | "forwarding") { settings.default_page = "monitor".into(); }
+    settings.terminal_font_size = settings.terminal_font_size.clamp(11, 32);
+    settings.terminal_scrollback = settings.terminal_scrollback.clamp(100, 100_000);
+    if !matches!(settings.monitor_interval_seconds, 2 | 5 | 10 | 30) { settings.monitor_interval_seconds = 2; }
+    if !matches!(settings.transfer_conflict_policy.as_str(), "ask" | "overwrite" | "skip" | "rename" | "resume") { settings.transfer_conflict_policy = "ask".into(); }
+    settings.command_retention_days = settings.command_retention_days.clamp(1, 3650);
+    settings.command_retention_mb = settings.command_retention_mb.clamp(10, 10_000);
+    if previous_version < 2 {
         for rule in &mut settings.suppression_rules {
             if rule.id == "monitor-sample" && rule.source.as_deref() == Some("monitor") {
                 rule.operation_kind = Some("monitor.sample".into());
@@ -538,7 +572,8 @@ async fn sftp_upload(
     remote_directory: String,
     channel: Channel<StreamEnvelope<TransferProgress>>,
 ) -> AppResult<String> {
-    state.ssh.sftp_upload(&host_id, local_paths, &remote_directory, channel).await
+    let policy = transfer_policy(&state.db);
+    state.ssh.sftp_upload(&host_id, local_paths, &remote_directory, &policy, channel).await
 }
 
 #[tauri::command]
@@ -560,7 +595,8 @@ async fn sftp_download(
     local_directory: String,
     channel: Channel<StreamEnvelope<TransferProgress>>,
 ) -> AppResult<String> {
-    state.ssh.sftp_download(&host_id, remote_paths, &local_directory, channel).await
+    let policy = transfer_policy(&state.db);
+    state.ssh.sftp_download(&host_id, remote_paths, &local_directory, &policy, channel).await
 }
 
 #[tauri::command]
@@ -594,7 +630,12 @@ async fn sftp_mkdir(state: State<'_, AppState>, host_id: String, path: String) -
 }
 #[tauri::command]
 async fn sftp_start_copy(state: State<'_, AppState>, host_id: String, sources: Vec<String>, destination_directory: String, channel: Channel<StreamEnvelope<TransferProgress>>) -> AppResult<String> {
-    state.ssh.sftp_copy(&host_id, sources, destination_directory, channel).await
+    let policy = transfer_policy(&state.db);
+    state.ssh.sftp_copy(&host_id, sources, destination_directory, &policy, channel).await
+}
+
+fn transfer_policy(db: &Database) -> String {
+    db.setting_get("app").ok().flatten().and_then(|value| serde_json::from_str::<AppSettings>(&value).ok()).map(|settings| settings.transfer_conflict_policy).unwrap_or_else(|| "ask".into())
 }
 
 #[tauri::command]
@@ -612,9 +653,11 @@ fn forward_upsert(
     state: State<'_, AppState>,
     mut profile: ForwardingProfile,
 ) -> AppResult<ForwardingProfile> {
-    if profile.bind_port == 0 {
+    if profile.bind_port == 0 || profile.bind_address.trim().is_empty() {
         return Err(AppError::Validation("监听端口无效".into()));
     }
+    if !matches!(profile.kind.as_str(), "local" | "remote" | "dynamic") { return Err(AppError::Validation("转发类型无效".into())); }
+    if profile.kind != "dynamic" && (profile.target_host.as_deref().unwrap_or("").trim().is_empty() || profile.target_port.unwrap_or(0) == 0) { return Err(AppError::Validation("目标地址和端口不能为空".into())); }
     profile.active = false;
     profile.status = "stopped".into();
     profile.last_error = None;
@@ -736,7 +779,7 @@ fn config_export(state: State<'_, AppState>, path: PathBuf, host_id: Option<Stri
 fn config_import(state: State<'_, AppState>, path: PathBuf) -> AppResult<Vec<HostProfile>> {
     let value: serde_json::Value = serde_json::from_slice(&std::fs::read(path)?)
         .map_err(|e| AppError::Validation(e.to_string()))?;
-    let hosts: Vec<HostProfile> =
+    let mut hosts: Vec<HostProfile> =
         serde_json::from_value(value.get("hosts").cloned().unwrap_or_default())
             .map_err(|e| AppError::Validation(e.to_string()))?;
     let existing = state
@@ -745,11 +788,22 @@ fn config_import(state: State<'_, AppState>, path: PathBuf) -> AppResult<Vec<Hos
         .into_iter()
         .map(|h| h.id)
         .collect::<std::collections::HashSet<_>>();
-    for host in &hosts {
-        if !existing.contains(&host.id) {
-            state.db.host_upsert(host)?
-        }
+    let now = Utc::now().to_rfc3339();
+    let mut pending = Vec::new();
+    let mut imported_ids = std::collections::HashSet::new();
+    for host in &mut hosts {
+        if host.id.trim().is_empty() || host.name.trim().is_empty() || host.hostname.trim().is_empty() || host.username.trim().is_empty() || host.port == 0 || !imported_ids.insert(host.id.clone()) { return Err(AppError::Validation("导入配置包含无效或重复的服务器字段".into())); }
+        host.name = host.name.trim().to_owned();
+        host.hostname = host.hostname.trim().to_owned();
+        host.username = host.username.trim().to_owned();
+        host.credential_id = None;
+        host.status = "disconnected".into();
+        host.last_connected_at = None;
+        host.updated_at = now.clone();
+        if host.created_at.is_empty() { host.created_at = now.clone(); }
+        if !existing.contains(&host.id) { pending.push(host.clone()); }
     }
+    state.db.hosts_upsert(&pending)?;
     Ok(hosts)
 }
 
@@ -795,6 +849,8 @@ pub fn run() {
             credentials_set,
             credentials_delete,
             ssh_connect,
+            ssh_host_key_pending,
+            ssh_trust_host_key,
             ssh_disconnect,
             terminal_open,
             terminal_input,
