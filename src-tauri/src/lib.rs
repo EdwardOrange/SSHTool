@@ -59,6 +59,19 @@ fn operation_record(
     stdout: String,
     stderr: String,
 ) {
+    operation_record_with_kind(state, host_id, source, source, command, status, stdout, stderr);
+}
+
+fn operation_record_with_kind(
+    state: &AppState,
+    host_id: Option<String>,
+    source: &str,
+    operation_kind: &str,
+    command: String,
+    status: &str,
+    stdout: String,
+    stderr: String,
+) {
     let host_name = host_id
         .as_deref()
         .and_then(|id| state.ssh.profile(id).ok())
@@ -79,7 +92,7 @@ fn operation_record(
             status: status.into(),
             repeat_count: 1,
             equivalent: Some(true),
-            operation_kind: Some(source.into()),
+            operation_kind: Some(operation_kind.into()),
         },
     );
 }
@@ -160,9 +173,9 @@ fn hosts_upsert(state: State<'_, AppState>, draft: HostDraft) -> AppResult<HostP
 }
 #[tauri::command]
 async fn hosts_delete(state: State<'_, AppState>, id: String) -> AppResult<()> {
-    state.monitor.stop(&id);
+    state.monitor.stop_host(&id);
     if let Ok(profiles) = state.db.forward_list(&id) {
-        for profile in profiles { state.ssh.forward_stop(&profile.id); }
+        for profile in profiles { let _ = state.ssh.forward_stop(&profile.id).await; }
     }
     let credential_id = state.db.host_get(&id).ok().and_then(|host| host.credential_id);
     let _ = state.ssh.disconnect(&id).await;
@@ -242,7 +255,7 @@ fn ssh_trust_host_key(state: State<'_, AppState>, host_id: String, fingerprint: 
 }
 #[tauri::command]
 async fn ssh_disconnect(state: State<'_, AppState>, host_id: String) -> AppResult<()> {
-    state.monitor.stop(&host_id);
+    state.monitor.stop_host(&host_id);
     state.ssh.disconnect(&host_id).await
 }
 
@@ -295,6 +308,11 @@ async fn terminal_close(state: State<'_, AppState>, session_id: String) -> AppRe
 }
 
 #[tauri::command]
+fn terminal_set_audit(state: State<'_, AppState>, session_id: String, enabled: bool) -> AppResult<()> {
+    state.ssh.terminal_set_audit(&session_id, enabled)
+}
+
+#[tauri::command]
 fn monitor_start(
     state: State<'_, AppState>,
     host_id: String,
@@ -309,8 +327,8 @@ fn monitor_start(
         .start(host_id, state.ssh.clone(), state.db.clone(), channel, interval_seconds.unwrap_or(2) as u64)
 }
 #[tauri::command]
-fn monitor_stop(state: State<'_, AppState>, host_id: String) {
-    state.monitor.stop(&host_id)
+fn monitor_stop(state: State<'_, AppState>, task_id: String) {
+    state.monitor.stop(&task_id)
 }
 #[tauri::command]
 fn monitor_query(
@@ -485,83 +503,23 @@ fn settings_reset(state: State<'_, AppState>) -> AppResult<AppSettings> {
     Ok(settings)
 }
 
-#[allow(unreachable_code)]
 #[tauri::command]
 async fn sftp_list(
     state: State<'_, AppState>,
     host_id: String,
     path: String,
 ) -> AppResult<Vec<SftpEntry>> {
-    let started = std::time::Instant::now();
-    let entries = state.ssh.sftp_list(&host_id, &path).await?;
-    let _ = state.db.command_add(&CommandRecord {
-        id: Uuid::new_v4().to_string(),
-        timestamp: Utc::now().to_rfc3339(),
-        host_id: Some(host_id.clone()),
-        host_name: state.ssh.profile(&host_id).ok().map(|h| h.name),
-        source: "sftp".into(),
-        command: format!("sftp> ls -la {}", path),
-        stdout: format!("列出 {} 个条目", entries.len()),
-        stderr: String::new(),
-        exit_code: Some(0),
-        duration_ms: started.elapsed().as_millis() as u64,
-        status: "success".into(),
-        repeat_count: 1,
-        equivalent: Some(true),
-        operation_kind: Some("sftp.list".into()),
-    });
-    return Ok(entries);
-
-    let quoted = security::shell_quote(&path)?;
-    let cmd = format!(
-        "LANG=C find {quoted} -mindepth 1 -maxdepth 1 -printf '%y\\t%s\\t%T@\\t%m\\t%f\\n' 2>/dev/null | head -n 1000"
-    );
-    let output = state.ssh.exec(&host_id, &cmd).await?;
-    if output.exit_code != 0 {
-        return Err(AppError::Other(output.stderr));
+    let command = format!("sftp> ls -la {path}");
+    match state.ssh.sftp_list(&host_id, &path).await {
+        Ok(entries) => {
+            operation_record_with_kind(&state, Some(host_id), "sftp", "sftp.list", command, "success", format!("列出 {} 个条目", entries.len()), String::new());
+            Ok(entries)
+        }
+        Err(error) => {
+            operation_record_with_kind(&state, Some(host_id), "sftp", "sftp.list", command, "error", String::new(), error.to_string());
+            Err(error)
+        }
     }
-    let base = path.trim_end_matches('/');
-    let entries: Vec<SftpEntry> = output
-        .stdout
-        .lines()
-        .filter_map(|line| {
-            let p: Vec<&str> = line.splitn(5, '\t').collect();
-            if p.len() != 5 {
-                return None;
-            }
-            let name = p[4].to_string();
-            Some(SftpEntry {
-                name: name.clone(),
-                path: format!("{}/{}", if base.is_empty() { "" } else { base }, name),
-                kind: match p[0] {
-                    "d" => "directory",
-                    "l" => "symlink",
-                    _ => "file",
-                }
-                .into(),
-                size: p[1].parse().unwrap_or(0),
-                modified_at: None,
-                permissions: Some(p[3].into()),
-            })
-        })
-        .collect();
-    let _ = state.db.command_add(&CommandRecord {
-        id: Uuid::new_v4().to_string(),
-        timestamp: Utc::now().to_rfc3339(),
-        host_id: Some(host_id.clone()),
-        host_name: state.ssh.profile(&host_id).ok().map(|h| h.name),
-        source: "sftp".into(),
-        command: format!("sftp> ls -la {}", path),
-        stdout: format!("列出 {} 个条目", entries.len()),
-        stderr: output.stderr,
-        exit_code: Some(output.exit_code),
-        duration_ms: output.duration_ms,
-        status: "success".into(),
-        repeat_count: 1,
-        equivalent: Some(true),
-        operation_kind: Some("sftp.list".into()),
-    });
-    Ok(entries)
 }
 
 #[tauri::command]
@@ -571,9 +529,20 @@ async fn sftp_upload(
     local_paths: Vec<String>,
     remote_directory: String,
     channel: Channel<StreamEnvelope<TransferProgress>>,
+    conflict_policy: Option<String>,
 ) -> AppResult<String> {
-    let policy = transfer_policy(&state.db);
-    state.ssh.sftp_upload(&host_id, local_paths, &remote_directory, &policy, channel).await
+    let policy = conflict_policy.filter(|value| matches!(value.as_str(), "ask" | "overwrite" | "skip" | "rename" | "resume")).unwrap_or_else(|| transfer_policy(&state.db));
+    let command = format!("sftp> put {} {} (冲突策略: {})", local_paths.join(" "), remote_directory, policy);
+    match state.ssh.sftp_upload(&host_id, local_paths, &remote_directory, &policy, channel).await {
+        Ok(transfer_id) => {
+            operation_record_with_kind(&state, Some(host_id), "sftp", "sftp.upload", command, "success", format!("传输任务已启动：{transfer_id}"), String::new());
+            Ok(transfer_id)
+        }
+        Err(error) => {
+            operation_record_with_kind(&state, Some(host_id), "sftp", "sftp.upload", command, "error", String::new(), error.to_string());
+            Err(error)
+        }
+    }
 }
 
 #[tauri::command]
@@ -583,8 +552,9 @@ async fn sftp_start_upload(
     local_paths: Vec<String>,
     remote_directory: String,
     channel: Channel<StreamEnvelope<TransferProgress>>,
+    conflict_policy: Option<String>,
 ) -> AppResult<String> {
-    sftp_upload(state, host_id, local_paths, remote_directory, channel).await
+    sftp_upload(state, host_id, local_paths, remote_directory, channel, conflict_policy).await
 }
 
 #[tauri::command]
@@ -594,9 +564,20 @@ async fn sftp_download(
     remote_paths: Vec<String>,
     local_directory: String,
     channel: Channel<StreamEnvelope<TransferProgress>>,
+    conflict_policy: Option<String>,
 ) -> AppResult<String> {
-    let policy = transfer_policy(&state.db);
-    state.ssh.sftp_download(&host_id, remote_paths, &local_directory, &policy, channel).await
+    let policy = conflict_policy.filter(|value| matches!(value.as_str(), "ask" | "overwrite" | "skip" | "rename" | "resume")).unwrap_or_else(|| transfer_policy(&state.db));
+    let command = format!("sftp> get {} {} (冲突策略: {})", remote_paths.join(" "), local_directory, policy);
+    match state.ssh.sftp_download(&host_id, remote_paths, &local_directory, &policy, channel).await {
+        Ok(transfer_id) => {
+            operation_record_with_kind(&state, Some(host_id), "sftp", "sftp.download", command, "success", format!("传输任务已启动：{transfer_id}"), String::new());
+            Ok(transfer_id)
+        }
+        Err(error) => {
+            operation_record_with_kind(&state, Some(host_id), "sftp", "sftp.download", command, "error", String::new(), error.to_string());
+            Err(error)
+        }
+    }
 }
 
 #[tauri::command]
@@ -606,32 +587,49 @@ async fn sftp_start_download(
     remote_paths: Vec<String>,
     local_directory: String,
     channel: Channel<StreamEnvelope<TransferProgress>>,
+    conflict_policy: Option<String>,
 ) -> AppResult<String> {
-    sftp_download(state, host_id, remote_paths, local_directory, channel).await
+    sftp_download(state, host_id, remote_paths, local_directory, channel, conflict_policy).await
 }
 
 #[tauri::command]
 async fn sftp_delete(state: State<'_, AppState>, host_id: String, paths: Vec<String>) -> AppResult<()> {
-    state.ssh.sftp_delete(&host_id, &paths).await?;
-    operation_record(&state, Some(host_id), "sftp", format!("sftp> rm {}", paths.join(" ")), "success", String::new(), String::new());
-    Ok(())
+    let command = format!("sftp> rm {}", paths.join(" "));
+    match state.ssh.sftp_delete(&host_id, &paths).await {
+        Ok(()) => { operation_record_with_kind(&state, Some(host_id), "sftp", "sftp.delete", command, "success", String::new(), String::new()); Ok(()) }
+        Err(error) => { operation_record_with_kind(&state, Some(host_id), "sftp", "sftp.delete", command, "error", String::new(), error.to_string()); Err(error) }
+    }
 }
 #[tauri::command]
 async fn sftp_rename(state: State<'_, AppState>, host_id: String, path: String, new_path: String) -> AppResult<()> {
-    state.ssh.sftp_rename(&host_id, &path, &new_path).await?;
-    operation_record(&state, Some(host_id), "sftp", format!("sftp> rename {} {}", path, new_path), "success", String::new(), String::new());
-    Ok(())
+    let command = format!("sftp> rename {path} {new_path}");
+    match state.ssh.sftp_rename(&host_id, &path, &new_path).await {
+        Ok(()) => { operation_record_with_kind(&state, Some(host_id), "sftp", "sftp.rename", command, "success", String::new(), String::new()); Ok(()) }
+        Err(error) => { operation_record_with_kind(&state, Some(host_id), "sftp", "sftp.rename", command, "error", String::new(), error.to_string()); Err(error) }
+    }
 }
 #[tauri::command]
 async fn sftp_mkdir(state: State<'_, AppState>, host_id: String, path: String) -> AppResult<()> {
-    state.ssh.sftp_mkdir(&host_id, &path).await?;
-    operation_record(&state, Some(host_id), "sftp", format!("sftp> mkdir {}", path), "success", String::new(), String::new());
-    Ok(())
+    let command = format!("sftp> mkdir {path}");
+    match state.ssh.sftp_mkdir(&host_id, &path).await {
+        Ok(()) => { operation_record_with_kind(&state, Some(host_id), "sftp", "sftp.mkdir", command, "success", String::new(), String::new()); Ok(()) }
+        Err(error) => { operation_record_with_kind(&state, Some(host_id), "sftp", "sftp.mkdir", command, "error", String::new(), error.to_string()); Err(error) }
+    }
 }
 #[tauri::command]
-async fn sftp_start_copy(state: State<'_, AppState>, host_id: String, sources: Vec<String>, destination_directory: String, channel: Channel<StreamEnvelope<TransferProgress>>) -> AppResult<String> {
-    let policy = transfer_policy(&state.db);
-    state.ssh.sftp_copy(&host_id, sources, destination_directory, &policy, channel).await
+async fn sftp_start_copy(state: State<'_, AppState>, host_id: String, sources: Vec<String>, destination_directory: String, channel: Channel<StreamEnvelope<TransferProgress>>, conflict_policy: Option<String>) -> AppResult<String> {
+    let policy = conflict_policy.filter(|value| matches!(value.as_str(), "ask" | "overwrite" | "skip" | "rename" | "resume")).unwrap_or_else(|| transfer_policy(&state.db));
+    let command = format!("sftp> cp {} {} (冲突策略: {})", sources.join(" "), destination_directory, policy);
+    match state.ssh.sftp_copy(&host_id, sources, destination_directory, &policy, channel).await {
+        Ok(transfer_id) => {
+            operation_record_with_kind(&state, Some(host_id), "sftp", "sftp.copy", command, "success", format!("传输任务已启动：{transfer_id}"), String::new());
+            Ok(transfer_id)
+        }
+        Err(error) => {
+            operation_record_with_kind(&state, Some(host_id), "sftp", "sftp.copy", command, "error", String::new(), error.to_string());
+            Err(error)
+        }
+    }
 }
 
 fn transfer_policy(db: &Database) -> String {
@@ -710,8 +708,8 @@ async fn forward_start(state: State<'_, AppState>, id: String) -> AppResult<Forw
     }
 }
 #[tauri::command]
-fn forward_stop(state: State<'_, AppState>, id: String) -> AppResult<ForwardingProfile> {
-    state.ssh.forward_stop(&id);
+async fn forward_stop(state: State<'_, AppState>, id: String) -> AppResult<ForwardingProfile> {
+    state.ssh.forward_stop(&id).await?;
     let mut profile = state
         .db
         .forward_list("")?
@@ -746,8 +744,8 @@ fn toggle_forward(state: &State<'_, AppState>, id: &str, active: bool) -> AppRes
 }
 
 #[tauri::command]
-fn forward_delete(state: State<'_, AppState>, id: String) -> AppResult<()> {
-    state.ssh.forward_stop(&id);
+async fn forward_delete(state: State<'_, AppState>, id: String) -> AppResult<()> {
+    state.ssh.forward_stop(&id).await?;
     state.db.forward_delete(&id)
 }
 
@@ -856,6 +854,7 @@ pub fn run() {
             terminal_input,
             terminal_resize,
             terminal_close,
+            terminal_set_audit,
             monitor_start,
             monitor_stop,
             monitor_query,

@@ -22,7 +22,12 @@ export default function TerminalView({ host, active = true }: { host: HostProfil
   const [menu, setMenu] = React.useState<{ x: number; y: number } | null>(null);
   const [pastePreview, setPastePreview] = React.useState<string>();
   const pasteProtectionRef = React.useRef(true);
+  const auditEnabledRef = React.useRef(true);
+  const sessionIdRef = React.useRef<string | undefined>(undefined);
+  const activeRef = React.useRef(active);
   pasteProtectionRef.current = settings?.terminalPasteProtection !== false;
+  auditEnabledRef.current = settings?.terminalCommandLogging !== false;
+  activeRef.current = active;
 
   React.useEffect(() => {
     if (!containerRef.current) return;
@@ -54,32 +59,47 @@ export default function TerminalView({ host, active = true }: { host: HostProfil
       const text = event.clipboardData?.getData("text/plain") || "";
       if (!text) return;
       event.preventDefault();
+      event.stopPropagation();
       setPastePreview(text);
     };
-    containerRef.current.addEventListener("paste", onPaste);
+    // xterm installs its own paste listener on the terminal element. Capture
+    // before it so the safety dialog cannot be bypassed by Ctrl/Cmd+V.
+    containerRef.current.addEventListener("paste", onPaste, true);
 
     void api.terminalOpen(host.id, terminal.cols, terminal.rows, settings?.terminalCommandLogging !== false, (event) => {
       if (!disposed) terminal.write(decoder.decode(new Uint8Array(event.payload), { stream: true }));
     }).then((id) => {
       if (disposed) { void api.terminalClose(id); return; }
       sessionId = id;
+      sessionIdRef.current = id;
+      void api.terminalSetAudit(id, auditEnabledRef.current).catch((reason) => !disposed && setError(formatError(reason)));
       for (const bytes of pending.splice(0)) send(bytes);
       queuedBytes = 0;
     }).catch((reason) => {
       if (!disposed) { setError(formatError(reason)); terminal.writeln(`\r\n\x1b[31m${formatError(reason)}\x1b[0m`); }
     });
 
-    const observer = new ResizeObserver(() => { fit.fit(); if (sessionId) void api.terminalResize(sessionId, terminal.cols, terminal.rows); });
+    const observer = new ResizeObserver(() => {
+      if (!activeRef.current) return;
+      fit.fit();
+      if (sessionId) void api.terminalResize(sessionId, terminal.cols, terminal.rows);
+    });
     observer.observe(containerRef.current);
-    const onKey = (event: KeyboardEvent) => { if (event.ctrlKey && event.shiftKey && event.key.toLowerCase() === "c" && terminal.hasSelection()) { void navigator.clipboard.writeText(terminal.getSelection()); event.preventDefault(); } };
+    const onKey = (event: KeyboardEvent) => { if (activeRef.current && event.ctrlKey && event.shiftKey && event.key.toLowerCase() === "c" && terminal.hasSelection()) { void navigator.clipboard.writeText(terminal.getSelection()); event.preventDefault(); } };
     window.addEventListener("keydown", onKey);
     return () => {
-      disposed = true; inputSubscription.dispose(); observer.disconnect(); window.removeEventListener("keydown", onKey); containerRef.current?.removeEventListener("paste", onPaste);
+      disposed = true; inputSubscription.dispose(); observer.disconnect(); window.removeEventListener("keydown", onKey); containerRef.current?.removeEventListener("paste", onPaste, true);
       const closingSession = sessionId;
       if (closingSession) void sendChain.finally(() => api.terminalClose(closingSession));
+      sessionIdRef.current = undefined;
       terminal.dispose(); termRef.current = null; fitAddonRef.current = null; searchAddonRef.current = null;
     };
   }, [host.id]);
+
+  React.useEffect(() => {
+    const sessionId = sessionIdRef.current;
+    if (sessionId) void api.terminalSetAudit(sessionId, settings?.terminalCommandLogging !== false).catch((reason) => setError(formatError(reason)));
+  }, [settings?.terminalCommandLogging]);
 
   React.useEffect(() => {
     if (!termRef.current) return;
@@ -99,7 +119,8 @@ export default function TerminalView({ host, active = true }: { host: HostProfil
 
   const doSearch = () => { if (search) searchAddonRef.current?.findNext(search); };
   const requestPaste = async () => {
-    const text = await navigator.clipboard.readText();
+    let text = "";
+    try { text = await navigator.clipboard.readText(); } catch (reason) { setError(formatError(reason)); return; }
     if (!text) return;
     if (pasteProtectionRef.current) setPastePreview(text); else termRef.current?.paste(text);
   };

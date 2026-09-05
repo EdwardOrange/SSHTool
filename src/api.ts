@@ -10,6 +10,8 @@ const demoHosts: HostProfile[] = [
   { id: "demo-test", name: "测试服务器", hostname: "192.168.56.10", port: 22, username: "dev", groupName: "测试环境", tags: ["debian"], favorite: false, authMethod: "password", jumpHosts: [], status: "disconnected", createdAt: now(), updatedAt: now() },
 ];
 let mockHosts = [...demoHosts];
+const mockMonitorTimers = new Map<string, number>();
+const mockMonitorTaskByHost = new Map<string, string>();
 
 export const api = {
   async hostsList(): Promise<HostProfile[]> { return isTauri() ? invoke("hosts_list") : mockHosts; },
@@ -34,19 +36,35 @@ export const api = {
   async terminalInput(sessionId: string, data: number[]) { if (isTauri()) await invoke("terminal_input", { sessionId, data }); },
   async terminalResize(sessionId: string, cols: number, rows: number) { if (isTauri()) await invoke("terminal_resize", { sessionId, cols, rows }); },
   async terminalClose(sessionId: string) { if (isTauri()) await invoke("terminal_close", { sessionId }); },
+  async terminalSetAudit(sessionId: string, enabled: boolean) { if (isTauri()) await invoke("terminal_set_audit", { sessionId, enabled }); },
   async monitorStart(hostId: string, onData: (data: StreamEnvelope<MetricSnapshot>) => void, intervalSeconds = 2): Promise<string> {
     if (!isTauri()) {
+      const previousTask = mockMonitorTaskByHost.get(hostId);
+      const previous = previousTask ? mockMonitorTimers.get(previousTask) : undefined;
+      if (previous) window.clearInterval(previous);
+      if (previousTask) mockMonitorTimers.delete(previousTask);
+      const taskId = crypto.randomUUID();
       const timer = window.setInterval(() => {
         const t = Date.now() / 1000;
         const snapshot: MetricSnapshot = { hostId, timestamp: now(), cpuPercent: 28 + Math.sin(t / 3) * 12 + Math.random() * 5, memoryPercent: 62 + Math.sin(t / 8) * 3, diskPercent: 48.7, load1: 1.35 + Math.sin(t / 5) * .35, rxBytesPerSec: 1_400_000 + Math.random() * 2_500_000, txBytesPerSec: 620_000 + Math.random() * 1_100_000, connectionCount: 42 + Math.floor(Math.random() * 8), memoryUsedBytes: 10_650_000_000, memoryTotalBytes: 17_180_000_000, diskUsedBytes: 128_000_000_000, diskTotalBytes: 256_000_000_000, uptimeSeconds: 1_248_320, connections: [{ protocol: "tcp", state: "ESTAB", localAddress: "10.0.1.12:22", remoteAddress: "10.0.0.42:54218", process: "sshd" }, { protocol: "tcp", state: "ESTAB", localAddress: "10.0.1.12:443", remoteAddress: "172.16.1.18:39120", process: "nginx" }], topProcesses: [{ pid: 1428, name: "postgres", cpuPercent: 8.7, memoryPercent: 12.4 }, { pid: 918, name: "nginx", cpuPercent: 4.2, memoryPercent: 2.1 }, { pid: 2001, name: "node", cpuPercent: 3.8, memoryPercent: 5.7 }] };
         onData({ seq: Date.now(), timestamp: now(), hostId, payload: snapshot });
       }, intervalSeconds * 1000);
-      return String(timer);
+      mockMonitorTimers.set(taskId, timer);
+      mockMonitorTaskByHost.set(hostId, taskId);
+      return taskId;
     }
     const channel = new Channel<StreamEnvelope<MetricSnapshot>>(); channel.onmessage = onData;
     return invoke("monitor_start", { hostId, channel, intervalSeconds });
   },
-  async monitorStop(hostId: string) { if (isTauri()) await invoke("monitor_stop", { hostId }); },
+  async monitorStop(taskId: string) {
+    if (isTauri()) await invoke("monitor_stop", { taskId });
+    else {
+      const timer = mockMonitorTimers.get(taskId);
+      if (timer) window.clearInterval(timer);
+      mockMonitorTimers.delete(taskId);
+      for (const [hostId, currentTask] of mockMonitorTaskByHost) if (currentTask === taskId) mockMonitorTaskByHost.delete(hostId);
+    }
+  },
   async monitorQuery(hostId: string, range: string) { return isTauri() ? invoke<MetricSnapshot[]>("monitor_query", { hostId, range }) : []; },
   async firewallRead(hostId: string): Promise<FirewallState> {
     if (isTauri()) return invoke("firewall_read", { hostId });
@@ -76,24 +94,24 @@ export const api = {
   async commandLogClear(): Promise<void> { if (isTauri()) await invoke("command_log_clear"); },
   async configExport(path: string, hostId?: string): Promise<void> { if (isTauri()) await invoke("config_export", { path, hostId: hostId || null }); else { const host = mockHosts.find((item) => item.id === hostId); const blob = new Blob([JSON.stringify({ version: 2, hosts: host ? [{ ...host, credentialId: undefined, status: "disconnected" }] : mockHosts.map((item) => ({ ...item, credentialId: undefined, status: "disconnected" })) }, null, 2)], { type: "application/json" }); const url = URL.createObjectURL(blob); const anchor = document.createElement("a"); anchor.href = url; anchor.download = path || "ssh-config.json"; anchor.click(); URL.revokeObjectURL(url); } },
   async sftpList(hostId: string, path: string): Promise<SftpEntry[]> { return isTauri() ? invoke("sftp_list", { hostId, path }) : [{ name: "etc", path: "/etc", kind: "directory", size: 0, permissions: "drwxr-xr-x" }, { name: "var", path: "/var", kind: "directory", size: 0, permissions: "drwxr-xr-x" }, { name: "README.txt", path: "/README.txt", kind: "file", size: 4280, permissions: "-rw-r--r--", modifiedAt: now() }]; },
-  async sftpUpload(hostId: string, localPaths: string[], remoteDirectory: string, onData: (event: StreamEnvelope<TransferProgress>) => void): Promise<string> {
+  async sftpUpload(hostId: string, localPaths: string[], remoteDirectory: string, onData: (event: StreamEnvelope<TransferProgress>) => void, conflictPolicy?: AppSettings["transferConflictPolicy"]): Promise<string> {
     if (!isTauri()) return "";
     const channel = new Channel<StreamEnvelope<TransferProgress>>(); channel.onmessage = onData;
-    return invoke("sftp_start_upload", { hostId, localPaths, remoteDirectory, channel });
+    return invoke("sftp_start_upload", { hostId, localPaths, remoteDirectory, channel, conflictPolicy: conflictPolicy || null });
   },
-  async sftpDownload(hostId: string, remotePaths: string[], localDirectory: string, onData: (event: StreamEnvelope<TransferProgress>) => void): Promise<string> {
+  async sftpDownload(hostId: string, remotePaths: string[], localDirectory: string, onData: (event: StreamEnvelope<TransferProgress>) => void, conflictPolicy?: AppSettings["transferConflictPolicy"]): Promise<string> {
     if (!isTauri()) return "";
     const channel = new Channel<StreamEnvelope<TransferProgress>>(); channel.onmessage = onData;
-    return invoke("sftp_start_download", { hostId, remotePaths, localDirectory, channel });
+    return invoke("sftp_start_download", { hostId, remotePaths, localDirectory, channel, conflictPolicy: conflictPolicy || null });
   },
   async sftpCancel(transferId: string): Promise<void> { if (isTauri()) await invoke("sftp_cancel", { transferId }); },
   async sftpDelete(hostId: string, paths: string[]): Promise<void> { if (isTauri()) await invoke("sftp_delete", { hostId, paths }); },
   async sftpRename(hostId: string, path: string, newPath: string): Promise<void> { if (isTauri()) await invoke("sftp_rename", { hostId, path, newPath }); },
   async sftpMkdir(hostId: string, path: string): Promise<void> { if (isTauri()) await invoke("sftp_mkdir", { hostId, path }); },
-  async sftpCopy(hostId: string, sources: string[], destinationDirectory: string, onData: (event: StreamEnvelope<TransferProgress>) => void): Promise<string> {
+  async sftpCopy(hostId: string, sources: string[], destinationDirectory: string, onData: (event: StreamEnvelope<TransferProgress>) => void, conflictPolicy?: AppSettings["transferConflictPolicy"]): Promise<string> {
     if (!isTauri()) return "";
     const channel = new Channel<StreamEnvelope<TransferProgress>>(); channel.onmessage = onData;
-    return invoke("sftp_start_copy", { hostId, sources, destinationDirectory, channel });
+    return invoke("sftp_start_copy", { hostId, sources, destinationDirectory, channel, conflictPolicy: conflictPolicy || null });
   },
   async settingsGet(): Promise<AppSettings> { return isTauri() ? invoke("settings_get") : defaultSettings(); },
   async settingsUpdate(settings: AppSettings): Promise<AppSettings> { return isTauri() ? invoke("settings_update", { settings }) : settings; },

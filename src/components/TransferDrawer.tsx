@@ -11,7 +11,7 @@ export default function TransferDrawer() {
   if (!items.length) return null;
   const active = items.filter((task) => ["queued", "running"].includes(task.progress.status));
   return <Paper square variant="outlined" sx={{ borderLeft: 0, borderRight: 0, borderRadius: 0, zIndex: 2 }}>
-    <Stack direction="row" alignItems="center" spacing={1} sx={{ px: 1.5, py: .7 }}><FolderZipRounded color="primary" fontSize="small"/><Typography variant="subtitle2">文件传输</Typography><Chip size="small" label={`${active.length} 个进行中`} color={active.length ? "primary" : "default"}/><Box sx={{ flex: 1 }}/><Button size="small" onClick={clear} disabled={!items.some((task) => ["completed", "error", "cancelled"].includes(task.progress.status))}>清除已完成</Button><IconButton size="small" onClick={() => setExpanded((value) => !value)}>{expanded ? <ExpandMoreRounded/> : <ExpandLessRounded/>}</IconButton></Stack>
+    <Stack direction="row" alignItems="center" spacing={1} sx={{ px: 1.5, py: .7 }}><FolderZipRounded color="primary" fontSize="small"/><Typography variant="subtitle2">文件传输</Typography><Chip size="small" label={`${active.length} 个进行中`} color={active.length ? "primary" : "default"}/><Box sx={{ flex: 1 }}/><Button size="small" onClick={clear} disabled={!items.some((task) => ["completed", "error", "cancelled"].includes(task.progress.status))}>清除已完成</Button><IconButton aria-label={expanded ? "收起文件传输" : "展开文件传输"} size="small" onClick={() => setExpanded((value) => !value)}>{expanded ? <ExpandMoreRounded/> : <ExpandLessRounded/>}</IconButton></Stack>
     <Collapse in={expanded}><Divider/><Stack spacing={1} sx={{ px: 1.5, py: 1, maxHeight: 230, overflow: "auto" }}>{items.map((task) => <TransferRow key={task.progress.transferId} task={task}/>)}</Stack></Collapse>
   </Paper>;
 }

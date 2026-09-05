@@ -29,14 +29,16 @@ struct Previous {
 }
 
 pub struct MonitorManager {
-    tasks: RwLock<HashMap<String, watch::Sender<bool>>>,
+    tasks: Arc<RwLock<HashMap<String, watch::Sender<bool>>>>,
+    host_tasks: Arc<RwLock<HashMap<String, String>>>,
     previous: Arc<RwLock<HashMap<String, Previous>>>,
     sequence: Arc<AtomicU64>,
 }
 impl Default for MonitorManager {
     fn default() -> Self {
         Self {
-            tasks: RwLock::new(HashMap::new()),
+            tasks: Arc::new(RwLock::new(HashMap::new())),
+            host_tasks: Arc::new(RwLock::new(HashMap::new())),
             previous: Arc::new(RwLock::new(HashMap::new())),
             sequence: Arc::new(AtomicU64::new(1)),
         }
@@ -52,12 +54,16 @@ impl MonitorManager {
         channel: Channel<StreamEnvelope<MetricSnapshot>>,
         interval_seconds: u64,
     ) -> AppResult<String> {
-        self.stop(&host_id);
+        self.stop_host(&host_id);
         let (cancel_tx, mut cancel_rx) = watch::channel(false);
-        self.tasks.write().insert(host_id.clone(), cancel_tx);
+        let task_id = uuid::Uuid::new_v4().to_string();
+        self.tasks.write().insert(task_id.clone(), cancel_tx);
+        self.host_tasks.write().insert(host_id.clone(), task_id.clone());
         let previous = self.previous.clone();
         let sequence = self.sequence.clone();
-        let task_id = uuid::Uuid::new_v4().to_string();
+        let tasks = self.tasks.clone();
+        let host_tasks = self.host_tasks.clone();
+        let cleanup_task_id = task_id.clone();
         // `monitor_start` can be invoked by Tauri on the WebView/main thread,
         // where no Tokio reactor is entered. Always schedule long-running work
         // through Tauri's global async runtime so opening the monitor page can
@@ -70,13 +76,19 @@ impl MonitorManager {
                     let started=chrono::Utc::now(); match ssh.exec(&host_id,SAMPLE_COMMAND).await { Ok(output)=>{ if let Ok(snapshot)=parse_snapshot(&host_id,&output.stdout,&previous){ let _=db.metric_add(&snapshot,interval_seconds as u32); let _=db.command_add(&CommandRecord{id:uuid::Uuid::new_v4().to_string(),timestamp:started.to_rfc3339(),host_id:Some(host_id.clone()),host_name:ssh.profile(&host_id).ok().map(|h|h.name),source:"monitor".into(),command:redact(SAMPLE_COMMAND),stdout:"采样完成".into(),stderr:redact(&output.stderr),exit_code:Some(output.exit_code),duration_ms:output.duration_ms,status:if output.exit_code==0{"success".into()}else{"error".into()},repeat_count:1,equivalent:None,operation_kind:Some("monitor.sample".into())}); let _=channel.send(StreamEnvelope{seq:sequence.fetch_add(1,Ordering::Relaxed),timestamp:snapshot.timestamp.clone(),host_id:host_id.clone(),session_id:None,payload:snapshot}); } }, Err(error)=>{ let _=db.command_add(&CommandRecord{id:uuid::Uuid::new_v4().to_string(),timestamp:started.to_rfc3339(),host_id:Some(host_id.clone()),host_name:ssh.profile(&host_id).ok().map(|h|h.name),source:"monitor".into(),command:redact(SAMPLE_COMMAND),stdout:String::new(),stderr:redact(&error.to_string()),exit_code:None,duration_ms:0,status:"error".into(),repeat_count:1,equivalent:None,operation_kind:Some("monitor.sample".into())}); } }
                 }, _=cancel_rx.changed()=>break }
             }
+            tasks.write().remove(&cleanup_task_id);
+            if host_tasks.read().get(&host_id).is_some_and(|current| current == &cleanup_task_id) { host_tasks.write().remove(&host_id); }
         });
         Ok(task_id)
     }
-    pub fn stop(&self, host_id: &str) {
-        if let Some(tx) = self.tasks.write().remove(host_id) {
+    pub fn stop(&self, task_id: &str) {
+        if let Some(tx) = self.tasks.write().remove(task_id) {
             let _ = tx.send(true);
         }
+    }
+    pub fn stop_host(&self, host_id: &str) {
+        let task_id = self.host_tasks.write().remove(host_id);
+        if let Some(task_id) = task_id { self.stop(&task_id); }
     }
 }
 

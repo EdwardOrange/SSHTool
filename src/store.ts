@@ -20,7 +20,7 @@ interface AppState {
   transfers: Record<string, TransferTaskView>;
   settings: AppSettings | undefined;
   setHosts: (hosts: HostProfile[]) => void;
-  upsertHost: (host: HostProfile) => void;
+  upsertHost: (host: HostProfile, select?: boolean) => void;
   removeHost: (id: string) => void;
   selectHost: (id?: string) => void;
   setPage: (page: PageId) => void;
@@ -35,12 +35,20 @@ interface AppState {
   setSettings: (settings: AppSettings) => void;
 }
 
+const readPanelState = () => {
+  if (typeof window === "undefined") return { open: true, height: 216 };
+  return {
+    open: window.localStorage.getItem("command-panel-open") !== "false",
+    height: Math.max(140, Math.min(500, Number(window.localStorage.getItem("command-panel-height")) || 216)),
+  };
+};
+
 export const useAppStore = create<AppState>((set) => ({
-  hosts: [], page: "monitor", metrics: {}, firewall: {}, commands: [], commandPanelOpen: true, commandPanelHeight: 216, transfers: {}, settings: undefined,
+  hosts: [], page: "monitor", metrics: {}, firewall: {}, commands: [], commandPanelOpen: readPanelState().open, commandPanelHeight: readPanelState().height, transfers: {}, settings: undefined,
   setHosts: (hosts) => set({ hosts: hosts.map(normalizeHost), selectedHostId: hosts[0]?.id }),
-  upsertHost: (host) => set((s) => {
+  upsertHost: (host, select = true) => set((s) => {
     const normalized = normalizeHost(host);
-    return { hosts: s.hosts.some((h) => h.id === normalized.id) ? s.hosts.map((h) => h.id === normalized.id ? normalized : h) : [...s.hosts, normalized], selectedHostId: normalized.id };
+    return { hosts: s.hosts.some((h) => h.id === normalized.id) ? s.hosts.map((h) => h.id === normalized.id ? normalized : h) : [...s.hosts, normalized], ...(select ? { selectedHostId: normalized.id } : {}) };
   }),
   removeHost: (id) => set((s) => {
     const index = s.hosts.findIndex((host) => host.id === id);
@@ -57,8 +65,16 @@ export const useAppStore = create<AppState>((set) => ({
     return { commands: exists ? s.commands.map((item) => item.id === command.id ? { ...item, ...command } : item) : [...s.commands, command].slice(-2000) };
   }),
   setCommands: (commands) => set({ commands }),
-  toggleCommandPanel: () => set((s) => ({ commandPanelOpen: !s.commandPanelOpen })),
-  setCommandPanelHeight: (commandPanelHeight) => set({ commandPanelHeight }),
+  toggleCommandPanel: () => set((s) => {
+    const commandPanelOpen = !s.commandPanelOpen;
+    window.localStorage.setItem("command-panel-open", String(commandPanelOpen));
+    return { commandPanelOpen };
+  }),
+  setCommandPanelHeight: (commandPanelHeight) => {
+    const next = Math.max(140, Math.min(500, commandPanelHeight));
+    window.localStorage.setItem("command-panel-height", String(next));
+    set({ commandPanelHeight: next });
+  },
   upsertTransfer: (progress) => set((s) => {
     const now = Date.now(); const previous = s.transfers[progress.transferId];
     const normalized = previous && ["completed", "error", "cancelled"].includes(progress.status) && progress.total === 0 ? { ...progress, direction: previous.progress.direction, transferred: previous.progress.transferred, total: previous.progress.total, currentPath: previous.progress.currentPath, fileIndex: previous.progress.fileIndex, fileCount: previous.progress.fileCount, currentFileTransferred: previous.progress.currentFileTransferred, currentFileTotal: previous.progress.currentFileTotal } : progress;

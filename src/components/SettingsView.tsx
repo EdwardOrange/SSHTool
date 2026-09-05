@@ -40,13 +40,26 @@ export default function SettingsView({ open, onClose, onTheme }: SettingsViewPro
   };
 
   const persist = (next: AppSettings) => {
+    if (!settings) return;
+    const previous = settings;
     setSettings(next);
     pendingWrites.current += 1;
     setSaving(true);
     saveChain.current = saveChain.current
       .catch(() => undefined)
       .then(() => api.settingsUpdate(next))
-      .then(() => finishWrite(true), (reason) => { setError(formatError(reason)); finishWrite(false); });
+      .then((saved) => {
+        if (useAppStore.getState().settings === next) setSettings(saved);
+        finishWrite(true);
+      }, (reason) => {
+        if (useAppStore.getState().settings === next) {
+          setSettings(previous);
+          if (next.theme !== previous.theme) onTheme(previous.theme);
+          if (next.locale !== previous.locale) void i18n.changeLanguage(previous.locale);
+        }
+        setError(formatError(reason));
+        finishWrite(false);
+      });
   };
 
   const update = (patch: Partial<AppSettings>) => {
