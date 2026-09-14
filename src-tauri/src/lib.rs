@@ -118,6 +118,12 @@ fn hosts_upsert(state: State<'_, AppState>, draft: HostDraft) -> AppResult<HostP
     if draft.port == 0 {
         return Err(AppError::Validation("端口必须在 1–65535 之间".into()));
     }
+    if !matches!(draft.auth_method.as_str(), "password" | "key" | "agent" | "keyboardInteractive") {
+        return Err(AppError::Validation("认证方式无效".into()));
+    }
+    if draft.auth_method == "key" && draft.private_key_path.as_deref().is_none_or(|path| path.trim().is_empty()) {
+        return Err(AppError::Validation("请填写私钥路径".into()));
+    }
     let now = Utc::now().to_rfc3339();
     let id = draft.id.unwrap_or_else(|| Uuid::new_v4().to_string());
     let existing = state.db.host_get(&id).ok();
@@ -133,7 +139,7 @@ fn hosts_upsert(state: State<'_, AppState>, draft: HostDraft) -> AppResult<HostP
     if draft.auth_method != "password" || draft.remember_password == Some(false) {
         credential_id = None;
     }
-    if draft.remember_password.unwrap_or(false) {
+    if draft.auth_method == "password" && draft.remember_password.unwrap_or(false) {
         if let Some(password) = draft.password.as_deref() {
             let cid = credential_id.unwrap_or_else(|| format!("ssh:{id}"));
             security::store_secret(&cid, password)?;
@@ -199,19 +205,10 @@ async fn ssh_connect(
     host_id: String,
     password: Option<String>,
 ) -> AppResult<()> {
-    let mut host = state.db.host_get(&host_id)?;
+    let host = state.db.host_get(&host_id)?;
     let started = std::time::Instant::now();
     let result = state.ssh.connect(&state.db, host.clone(), password).await;
-    host.status = if result.is_ok() {
-        "connected".into()
-    } else {
-        "error".into()
-    };
-    if result.is_ok() {
-        host.last_connected_at = Some(Utc::now().to_rfc3339())
-    }
-    host.updated_at = Utc::now().to_rfc3339();
-    let _ = state.db.host_upsert(&host);
+    let _ = state.db.host_record_connection(&host_id, result.is_ok());
     let record = CommandRecord {
         id: Uuid::new_v4().to_string(),
         timestamp: Utc::now().to_rfc3339(),
@@ -644,13 +641,21 @@ fn sftp_cancel(state: State<'_, AppState>, transfer_id: String) -> AppResult<()>
 
 #[tauri::command]
 fn forward_list(state: State<'_, AppState>, host_id: String) -> AppResult<Vec<ForwardingProfile>> {
-    state.db.forward_list(&host_id)
+    let mut profiles = state.db.forward_list(&host_id)?;
+    for profile in &mut profiles {
+        profile.active = state.ssh.is_forward_active(&profile.id);
+        if profile.active { profile.status = "active".into(); }
+        else if profile.status != "error" { profile.status = "stopped".into(); }
+    }
+    Ok(profiles)
 }
 #[tauri::command]
 fn forward_upsert(
     state: State<'_, AppState>,
     mut profile: ForwardingProfile,
 ) -> AppResult<ForwardingProfile> {
+    state.db.host_get(&profile.host_id)?;
+    if state.ssh.is_forward_active(&profile.id) { return Err(AppError::Validation("请先停止转发再修改配置".into())); }
     if profile.bind_port == 0 || profile.bind_address.trim().is_empty() {
         return Err(AppError::Validation("监听端口无效".into()));
     }
@@ -795,6 +800,11 @@ fn config_import(state: State<'_, AppState>, path: PathBuf) -> AppResult<Vec<Hos
         host.hostname = host.hostname.trim().to_owned();
         host.username = host.username.trim().to_owned();
         host.credential_id = None;
+        host.host_key_fingerprint = None;
+        if !matches!(host.auth_method.as_str(), "password" | "key" | "agent" | "keyboardInteractive")
+            || (host.auth_method == "key" && host.private_key_path.as_deref().is_none_or(|path| path.trim().is_empty())) {
+            return Err(AppError::Validation("导入配置包含无效的认证方式或私钥路径".into()));
+        }
         host.status = "disconnected".into();
         host.last_connected_at = None;
         host.updated_at = now.clone();

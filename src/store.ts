@@ -36,9 +36,9 @@ interface AppState {
 }
 
 const readPanelState = () => {
-  if (typeof window === "undefined") return { open: true, height: 216 };
+  if (typeof window === "undefined") return { open: false, height: 216 };
   return {
-    open: window.localStorage.getItem("command-panel-open") !== "false",
+    open: window.localStorage.getItem("command-panel-open") === "true",
     height: Math.max(140, Math.min(500, Number(window.localStorage.getItem("command-panel-height")) || 216)),
   };
 };
@@ -54,7 +54,9 @@ export const useAppStore = create<AppState>((set) => ({
     const index = s.hosts.findIndex((host) => host.id === id);
     const hosts = s.hosts.filter((host) => host.id !== id);
     const selectedHostId = s.selectedHostId === id ? (hosts[index]?.id || hosts[index - 1]?.id) : s.selectedHostId;
-    return { hosts, selectedHostId };
+    const metrics = { ...s.metrics }; delete metrics[id];
+    const firewall = { ...s.firewall }; delete firewall[id];
+    return { hosts, selectedHostId, metrics, firewall };
   }),
   selectHost: (selectedHostId) => set({ selectedHostId }),
   setPage: (page) => set({ page }),
@@ -71,7 +73,7 @@ export const useAppStore = create<AppState>((set) => ({
     return { commandPanelOpen };
   }),
   setCommandPanelHeight: (commandPanelHeight) => {
-    const next = Math.max(140, Math.min(500, commandPanelHeight));
+    const next = Math.max(140, Math.min(500, Number.isFinite(commandPanelHeight) ? commandPanelHeight : 216));
     window.localStorage.setItem("command-panel-height", String(next));
     set({ commandPanelHeight: next });
   },

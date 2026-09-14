@@ -73,11 +73,12 @@ impl MonitorManager {
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 tokio::select! { _=ticker.tick()=>{
-                    let started=chrono::Utc::now(); match ssh.exec(&host_id,SAMPLE_COMMAND).await { Ok(output)=>{ if let Ok(snapshot)=parse_snapshot(&host_id,&output.stdout,&previous){ let _=db.metric_add(&snapshot,interval_seconds as u32); let _=db.command_add(&CommandRecord{id:uuid::Uuid::new_v4().to_string(),timestamp:started.to_rfc3339(),host_id:Some(host_id.clone()),host_name:ssh.profile(&host_id).ok().map(|h|h.name),source:"monitor".into(),command:redact(SAMPLE_COMMAND),stdout:"采样完成".into(),stderr:redact(&output.stderr),exit_code:Some(output.exit_code),duration_ms:output.duration_ms,status:if output.exit_code==0{"success".into()}else{"error".into()},repeat_count:1,equivalent:None,operation_kind:Some("monitor.sample".into())}); let _=channel.send(StreamEnvelope{seq:sequence.fetch_add(1,Ordering::Relaxed),timestamp:snapshot.timestamp.clone(),host_id:host_id.clone(),session_id:None,payload:snapshot}); } }, Err(error)=>{ let _=db.command_add(&CommandRecord{id:uuid::Uuid::new_v4().to_string(),timestamp:started.to_rfc3339(),host_id:Some(host_id.clone()),host_name:ssh.profile(&host_id).ok().map(|h|h.name),source:"monitor".into(),command:redact(SAMPLE_COMMAND),stdout:String::new(),stderr:redact(&error.to_string()),exit_code:None,duration_ms:0,status:"error".into(),repeat_count:1,equivalent:None,operation_kind:Some("monitor.sample".into())}); } }
+                    let started=chrono::Utc::now(); let output = tokio::select! { result = ssh.exec(&host_id, SAMPLE_COMMAND) => result, _ = cancel_rx.changed() => break }; match output { Ok(output)=>{ if let Ok(snapshot)=parse_snapshot(&host_id,&output.stdout,&previous){ let _=db.metric_add(&snapshot,interval_seconds as u32); let _=db.command_add(&CommandRecord{id:uuid::Uuid::new_v4().to_string(),timestamp:started.to_rfc3339(),host_id:Some(host_id.clone()),host_name:ssh.profile(&host_id).ok().map(|h|h.name),source:"monitor".into(),command:redact(SAMPLE_COMMAND),stdout:"采样完成".into(),stderr:redact(&output.stderr),exit_code:Some(output.exit_code),duration_ms:output.duration_ms,status:if output.exit_code==0{"success".into()}else{"error".into()},repeat_count:1,equivalent:None,operation_kind:Some("monitor.sample".into())}); let _=channel.send(StreamEnvelope{seq:sequence.fetch_add(1,Ordering::Relaxed),timestamp:snapshot.timestamp.clone(),host_id:host_id.clone(),session_id:None,payload:snapshot}); } }, Err(error)=>{ let _=db.command_add(&CommandRecord{id:uuid::Uuid::new_v4().to_string(),timestamp:started.to_rfc3339(),host_id:Some(host_id.clone()),host_name:ssh.profile(&host_id).ok().map(|h|h.name),source:"monitor".into(),command:redact(SAMPLE_COMMAND),stdout:String::new(),stderr:redact(&error.to_string()),exit_code:None,duration_ms:0,status:"error".into(),repeat_count:1,equivalent:None,operation_kind:Some("monitor.sample".into())}); } }
                 }, _=cancel_rx.changed()=>break }
             }
             tasks.write().remove(&cleanup_task_id);
-            if host_tasks.read().get(&host_id).is_some_and(|current| current == &cleanup_task_id) { host_tasks.write().remove(&host_id); }
+            let mut current_tasks = host_tasks.write();
+            if current_tasks.get(&host_id).is_some_and(|current| current == &cleanup_task_id) { current_tasks.remove(&host_id); previous.write().remove(&host_id); }
         });
         Ok(task_id)
     }
@@ -118,7 +119,8 @@ fn parse_snapshot(
     if cpu.len() < 4 {
         return Err(AppError::Other("无法解析 /proc/stat".into()));
     }
-    let total: u64 = cpu.iter().sum();
+    // guest and guest_nice are already included in user and nice.
+    let total: u64 = cpu.iter().take(8).sum();
     let idle = cpu.get(3).copied().unwrap_or(0) + cpu.get(4).copied().unwrap_or(0);
     let mem = section("MEM");
     let mut mem_total = 0u64;
@@ -258,6 +260,13 @@ fn parse_processes(input: &str) -> Vec<ProcessUsage> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn cpu_guest_time_is_not_counted_twice() {
+        let previous = Arc::new(RwLock::new(HashMap::new()));
+        parse_snapshot("host", "__STAT__\ncpu 100 0 0 100 0 0 0 0 50 0\n", &previous).unwrap();
+        let snapshot = parse_snapshot("host", "__STAT__\ncpu 200 0 0 200 0 0 0 0 150 0\n", &previous).unwrap();
+        assert!((snapshot.cpu_percent - 50.0).abs() < 0.001);
+    }
     #[test]
     fn parses_connections() {
         let v = parse_connections("tcp ESTAB 0 0 10.0.0.1:22 10.0.0.2:5000 users:sshd");

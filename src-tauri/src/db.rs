@@ -70,6 +70,17 @@ impl Database {
         self.0.lock().execute("INSERT INTO hosts(id,data,created_at,updated_at) VALUES(?1,?2,?3,?4) ON CONFLICT(id) DO UPDATE SET data=excluded.data,updated_at=excluded.updated_at", params![host.id,data,host.created_at,host.updated_at])?;
         Ok(())
     }
+    pub fn host_record_connection(&self, id: &str, connected: bool) -> AppResult<()> {
+        let connection = self.0.lock();
+        let data: String = connection.query_row("SELECT data FROM hosts WHERE id=?1", [id], |row| row.get(0))?;
+        let mut host: HostProfile = serde_json::from_str(&data).map_err(|error| AppError::Other(error.to_string()))?;
+        host.status = if connected { "connected".into() } else { "error".into() };
+        host.updated_at = chrono::Utc::now().to_rfc3339();
+        if connected { host.last_connected_at = Some(host.updated_at.clone()); }
+        let data = serde_json::to_string(&host).map_err(|error| AppError::Other(error.to_string()))?;
+        connection.execute("UPDATE hosts SET data=?2,updated_at=?3 WHERE id=?1", params![id, data, host.updated_at])?;
+        Ok(())
+    }
     pub fn hosts_upsert(&self, hosts: &[HostProfile]) -> AppResult<()> {
         let mut connection = self.0.lock();
         let transaction = connection.transaction()?;

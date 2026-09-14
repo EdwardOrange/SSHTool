@@ -1,5 +1,13 @@
-import { Brightness4Rounded, Brightness7Rounded, Circle, CloudOffRounded, LanguageRounded, MoreVertRounded, SettingsRounded, TerminalRounded } from "@mui/icons-material";
-import { Alert, AppBar, Box, Button, CircularProgress, Dialog, DialogActions, DialogContent, DialogTitle, Divider, IconButton, Menu, MenuItem, Snackbar, Stack, Tab, Tabs, TextField, Toolbar, Tooltip, Typography } from "@mui/material";
+import Brightness4Rounded from "@mui/icons-material/Brightness4Rounded";
+import Brightness7Rounded from "@mui/icons-material/Brightness7Rounded";
+import Circle from "@mui/icons-material/Circle";
+import CloudOffRounded from "@mui/icons-material/CloudOffRounded";
+import LanguageRounded from "@mui/icons-material/LanguageRounded";
+import MenuRounded from "@mui/icons-material/MenuRounded";
+import MoreVertRounded from "@mui/icons-material/MoreVertRounded";
+import SettingsRounded from "@mui/icons-material/SettingsRounded";
+import TerminalRounded from "@mui/icons-material/TerminalRounded";
+import { Alert, AppBar, Box, Button, CircularProgress, Dialog, DialogActions, DialogContent, DialogTitle, Divider, Drawer, Chip, IconButton, Menu, MenuItem, Snackbar, Stack, Tab, Tabs, TextField, Toolbar, Tooltip, Typography, useMediaQuery, useTheme } from "@mui/material";
 import { save } from "@tauri-apps/plugin-dialog";
 import React from "react";
 import { useTranslation } from "react-i18next";
@@ -7,24 +15,39 @@ import { api } from "./api";
 import CommandLedger from "./components/CommandLedger";
 import HostDialog from "./components/HostDialog";
 import ServerSidebar from "./components/ServerSidebar";
-import TerminalView from "./components/TerminalView";
 import TransferDrawer from "./components/TransferDrawer";
 import { useAppStore } from "./store";
 import type { HostProfile, PageId } from "./types";
+import { materialColors } from "./theme";
 import { formatError } from "./utils";
 
 const pages: { id: PageId; label: string }[] = [
   { id: "terminal", label: "terminal" }, { id: "monitor", label: "monitor" }, { id: "firewall", label: "firewall" }, { id: "sftp", label: "sftp" }, { id: "forwarding", label: "forwarding" },
 ];
+const TerminalView = React.lazy(() => import("./components/TerminalView"));
 const MonitorView = React.lazy(() => import("./components/MonitorView"));
 const FirewallView = React.lazy(() => import("./components/FirewallView"));
 const SftpView = React.lazy(() => import("./components/SftpView"));
 const ForwardingView = React.lazy(() => import("./components/ForwardingView"));
 const SettingsView = React.lazy(() => import("./components/SettingsView"));
 
-export default function App({ mode, toggleMode, setMode }: { mode: "light" | "dark"; toggleMode: () => void; setMode: React.Dispatch<React.SetStateAction<"light" | "dark">> }) {
+export default function App({ mode, setMode }: { mode: "light" | "dark"; setMode: React.Dispatch<React.SetStateAction<"light" | "dark">> }) {
   const { t, i18n } = useTranslation();
+  const theme = useTheme();
+  const colors = materialColors(mode);
+  const compact = useMediaQuery(theme.breakpoints.down("lg"));
+  const [sidebarOpen, setSidebarOpen] = React.useState(false);
+  const [actionPending, setActionPending] = React.useState(false);
+  const connectionLock = React.useRef(false);
   const hosts = useAppStore((s) => s.hosts); const setHosts = useAppStore((s) => s.setHosts); const selectedHostId = useAppStore((s) => s.selectedHostId); const page = useAppStore((s) => s.page); const setPage = useAppStore((s) => s.setPage); const upsertHost = useAppStore((s) => s.upsertHost); const removeHost = useAppStore((s) => s.removeHost); const setCommands = useAppStore((s) => s.setCommands); const addCommand = useAppStore((s) => s.addCommand); const setSettings = useAppStore((s) => s.setSettings); const settings = useAppStore((s) => s.settings);
+  const [terminalHostIds, setTerminalHostIds] = React.useState<string[]>([]);
+  React.useEffect(() => {
+    setTerminalHostIds((previous) => {
+      const next = previous.filter((id) => hosts.some((item) => item.id === id && item.status === "connected"));
+      if (page === "terminal" && selectedHostId && hosts.some((item) => item.id === selectedHostId && item.status === "connected") && !next.includes(selectedHostId)) next.push(selectedHostId);
+      return next.length === previous.length && next.every((id, index) => id === previous[index]) ? previous : next;
+    });
+  }, [hosts, page, selectedHostId]);
   const [loading, setLoading] = React.useState(true);
   const [startupError, setStartupError] = React.useState("");
   const [hostDialog, setHostDialog] = React.useState(false);
@@ -97,17 +120,18 @@ export default function App({ mode, toggleMode, setMode }: { mode: "light" | "da
         if (settings.locale !== i18n.language) void i18n.changeLanguage(settings.locale);
         if (pages.some((item) => item.id === settings.defaultPage)) setPage(settings.defaultPage);
       })
-      .then(() => api.commandLogSubscribe((event) => alive && addCommand(event.payload)))
+      .then(() => { if (alive) return api.commandLogSubscribe((event) => alive && addCommand(event.payload)); })
       .catch((error) => alive && setStartupError(String(error)))
       .finally(() => alive && setLoading(false));
     return () => { alive = false; };
   }, [setHosts, setCommands, addCommand, setSettings, setPage, i18n]);
 
   const toggleConnection = async () => {
-    if (!host) return;
+    if (!host || connectionLock.current) return;
+    connectionLock.current = true;
     setConnecting(true);
     try {
-      if (host.status === "connected") { await api.sshDisconnect(host.id); upsertHost({ ...host, status: "disconnected" }); }
+      if (host.status === "connected") { await api.sshDisconnect(host.id); upsertHost({ ...host, status: "disconnected" }, false); }
       else {
         let password: string | undefined;
         if ((host.authMethod === "password" || host.authMethod === "keyboardInteractive") && !host.credentialId) {
@@ -125,17 +149,26 @@ export default function App({ mode, toggleMode, setMode }: { mode: "light" | "da
         upsertHost({ ...host, status: "connected", lastConnectedAt: new Date().toISOString() }, false);
       }
     } catch (error) { upsertHost({ ...host, status: "error" }, false); setNotice(formatError(error)); }
-    finally { setConnecting(false); }
+    finally { connectionLock.current = false; setConnecting(false); }
   };
 
   const changeLanguage = () => {
     const next = i18n.language.startsWith("zh") ? "en" : "zh";
-    void i18n.changeLanguage(next); localStorage.setItem("locale", next);
-    const settings = useAppStore.getState().settings;
-    if (settings) { const updated = { ...settings, locale: next as "zh" | "en" }; setSettings(updated); void api.settingsUpdate(updated); }
+    const previous = useAppStore.getState().settings;
+    if (!previous) return;
+    const updated = { ...previous, locale: next as "zh" | "en" };
+    void i18n.changeLanguage(next); localStorage.setItem("locale", next); setSettings(updated);
+    themeSaveChain.current = themeSaveChain.current.catch(() => undefined).then(() => api.settingsUpdate(updated)).then((saved) => {
+      if (useAppStore.getState().settings === updated) setSettings(saved);
+    }, (reason) => {
+      if (useAppStore.getState().settings === updated) {
+        setSettings(previous); void i18n.changeLanguage(previous.locale); localStorage.setItem("locale", previous.locale);
+      }
+      setNotice(formatError(reason));
+    });
   };
 
-  const openAddHost = () => { setEditingHost(undefined); setHostDialog(true); };
+  const openAddHost = () => { setSidebarOpen(false); setEditingHost(undefined); setHostDialog(true); };
   const openEditHost = () => {
     if (!host) return;
     setMenuEl(null);
@@ -151,7 +184,8 @@ export default function App({ mode, toggleMode, setMode }: { mode: "light" | "da
     } catch (error) { setNotice(formatError(error)); }
   };
   const executeConfirmedAction = async () => {
-    if (!confirmAction) return;
+    if (!confirmAction || actionPending) return;
+    setActionPending(true);
     const target = confirmAction.host;
     try {
       if (confirmAction.kind === "edit") {
@@ -167,30 +201,31 @@ export default function App({ mode, toggleMode, setMode }: { mode: "light" | "da
       }
       setConfirmAction(null);
     } catch (error) { setNotice(formatError(error)); }
+    finally { setActionPending(false); }
   };
 
   return <Box sx={{ height: "100%", display: "flex", flexDirection: "column" }}>
-    <AppBar position="static" color="inherit" elevation={0} sx={{ borderBottom: 1, borderColor: "divider", zIndex: 5 }}><Toolbar variant="dense" className="drag-region" sx={{ minHeight: "52px!important", px: 1.5 }}><Stack direction="row" alignItems="center" spacing={1.2}><Box sx={{ width: 32, height: 32, borderRadius: 2.5, display: "grid", placeItems: "center", color: "white", background: "linear-gradient(135deg, #2E5BFF, #6C63E8)" }}><TerminalRounded fontSize="small"/></Box><Typography variant="subtitle1" fontWeight={800}>{t("appName")}</Typography></Stack><Box sx={{ flex: 1 }}/><Stack className="no-drag" direction="row" alignItems="center" spacing={.5}><Tooltip title={t("language")}><IconButton aria-label={t("language")} onClick={changeLanguage}><LanguageRounded fontSize="small"/></IconButton></Tooltip><Tooltip title={t("theme")}><IconButton aria-label={t("theme")} onClick={cycleTheme}>{mode === "dark" ? <Brightness7Rounded fontSize="small"/> : <Brightness4Rounded fontSize="small"/>}</IconButton></Tooltip><Tooltip title={t("settings")}><IconButton aria-label={t("settings")} onClick={() => setSettingsOpen(true)}><SettingsRounded fontSize="small"/></IconButton></Tooltip></Stack></Toolbar></AppBar>
-    <Box sx={{ display: "flex", flex: 1, minHeight: 0 }}><ServerSidebar onAdd={openAddHost}/><Box sx={{ flex: 1, minWidth: 0, display: "flex", flexDirection: "column" }}>
-      {host && <><Stack direction="row" alignItems="center" sx={{ minHeight: 50, px: 2, borderBottom: 1, borderColor: "divider", bgcolor: "background.paper" }}><Stack direction="row" alignItems="center" spacing={1}><Circle sx={{ fontSize: 10, color: host.status === "connected" ? "success.main" : host.status === "error" ? "error.main" : "text.disabled" }}/><Typography variant="subtitle2">{host.name}</Typography><Typography variant="caption" color="text.secondary" className="mono">{host.hostname}:{host.port}</Typography></Stack><Box sx={{ flex: 1 }}/><Button size="small" variant={host.status === "connected" ? "outlined" : "contained"} color={host.status === "connected" ? "inherit" : "primary"} onClick={toggleConnection} disabled={connecting} startIcon={connecting ? <CircularProgress size={16}/> : host.status === "connected" ? <CloudOffRounded/> : <TerminalRounded/>}>{host.status === "connected" ? t("disconnect") : t("connect")}</Button><IconButton aria-label="更多服务器操作" size="small" onClick={(event) => setMenuEl(event.currentTarget)}><MoreVertRounded/></IconButton></Stack><Menu anchorEl={menuEl} open={Boolean(menuEl)} onClose={() => setMenuEl(null)}><MenuItem onClick={openEditHost}>编辑服务器</MenuItem><MenuItem onClick={() => void exportHost()}>导出配置</MenuItem><Divider/><MenuItem sx={{ color: "error.main" }} onClick={() => { setMenuEl(null); setConfirmAction({ kind: "delete", host }); }}>删除服务器</MenuItem></Menu><Tabs value={page} onChange={(_, value) => setPage(value)} sx={{ minHeight: 45, px: 1.5, bgcolor: "background.paper", borderBottom: 1, borderColor: "divider", "& .MuiTab-root": { minHeight: 45 } }}>{pages.map((item) => <Tab key={item.id} value={item.id} label={t(item.label)}/>)}</Tabs></>}
-      <Box sx={{ flex: 1, minHeight: 0, p: host ? 2 : 0, position: "relative" }}>
+    <AppBar position="static" color="inherit" elevation={0} sx={{ borderBottom: 1, borderColor: "divider", zIndex: 5 }}><Toolbar variant="dense" className="drag-region" sx={{ minHeight: "64px!important", px: { xs: 1, sm: 3 }, gap: 1 }}><>{compact && <IconButton className="no-drag" aria-label="打开服务器列表" onClick={() => setSidebarOpen(true)}><MenuRounded/></IconButton>}</><Stack direction="row" alignItems="center" spacing={1.5}><Box sx={{ width: 40, height: 40, borderRadius: "12px", display: "grid", placeItems: "center", color: colors.onPrimaryContainer, bgcolor: colors.primaryContainer }}><TerminalRounded fontSize="small"/></Box><Typography variant="subtitle1" noWrap sx={{ maxWidth: { xs: 110, sm: "none" } }}>{t("appName")}</Typography></Stack>{!("__TAURI_INTERNALS__" in window) && <Chip label="演示数据" size="small" variant="outlined" sx={{ ml: 2, display: { xs: "none", sm: "inline-flex" } }}/>}<Box sx={{ flex: 1 }}/><Stack className="no-drag" direction="row" alignItems="center" spacing={.5}><Tooltip title={t("language")}><IconButton aria-label={t("language")} onClick={changeLanguage}><LanguageRounded fontSize="small"/></IconButton></Tooltip><Tooltip title={t("theme")}><IconButton aria-label={t("theme")} onClick={cycleTheme}>{mode === "dark" ? <Brightness7Rounded fontSize="small"/> : <Brightness4Rounded fontSize="small"/>}</IconButton></Tooltip><Tooltip title={t("settings")}><IconButton aria-label={t("settings")} onClick={() => setSettingsOpen(true)}><SettingsRounded fontSize="small"/></IconButton></Tooltip></Stack></Toolbar></AppBar>
+    <Box sx={{ display: "flex", flex: 1, minHeight: 0 }}>{compact ? <Drawer open={sidebarOpen} onClose={() => setSidebarOpen(false)} slotProps={{ paper: { sx: { borderRadius: "0 16px 16px 0" } } }}><ServerSidebar onAdd={openAddHost} onSelect={() => setSidebarOpen(false)}/></Drawer> : <ServerSidebar onAdd={openAddHost}/>}<Box sx={{ flex: 1, minWidth: 0, display: "flex", flexDirection: "column" }}>
+      {host && <><Stack direction="row" alignItems="center" sx={{ minHeight: 80, px: { xs: 2, sm: 3 }, gap: 1, bgcolor: "background.default" }}><Stack direction="row" alignItems="center" spacing={1} sx={{ minWidth: 0, flexWrap: "wrap" }}><Circle sx={{ fontSize: 10, color: host.status === "connected" ? "success.main" : host.status === "error" ? "error.main" : "text.disabled" }}/><Typography variant="h6" noWrap>{host.name}</Typography><Typography variant="caption" color="text.secondary" className="mono" sx={{ display: { xs: "none", sm: "block" } }}>{host.username}@{host.hostname}:{host.port}</Typography><Chip size="small" variant="outlined" color={host.status === "connected" ? "success" : "default"} label={host.status === "connected" ? "已连接" : host.status === "error" ? "连接失败" : "未连接"} sx={{ display: { xs: "none", md: "inline-flex" } }}/></Stack><Box sx={{ flex: 1 }}/><Button size="small" variant={host.status === "connected" ? "outlined" : "contained"} color={host.status === "connected" ? "inherit" : "primary"} onClick={toggleConnection} disabled={connecting} startIcon={connecting ? <CircularProgress size={16}/> : host.status === "connected" ? <CloudOffRounded/> : <TerminalRounded/>}>{host.status === "connected" ? t("disconnect") : t("connect")}</Button><IconButton aria-label="更多服务器操作" disabled={connecting || actionPending} size="small" onClick={(event) => setMenuEl(event.currentTarget)}><MoreVertRounded/></IconButton></Stack><Menu anchorEl={menuEl} open={Boolean(menuEl)} onClose={() => setMenuEl(null)}><MenuItem onClick={openEditHost}>编辑服务器</MenuItem><MenuItem onClick={() => void exportHost()}>导出配置</MenuItem><Divider/><MenuItem sx={{ color: "error.main" }} onClick={() => { setMenuEl(null); setConfirmAction({ kind: "delete", host }); }}>删除服务器</MenuItem></Menu><Tabs aria-label="服务器功能" variant="scrollable" scrollButtons="auto" allowScrollButtonsMobile value={page} onChange={(_, value) => setPage(value)} sx={{ minHeight: 48, px: { xs: 0, sm: 2 }, bgcolor: "background.default", borderBottom: 1, borderColor: "divider" }}>{pages.map((item) => <Tab key={item.id} value={item.id} id={`tab-${item.id}`} aria-controls={`panel-${item.id}`} label={t(item.label)}/>)}</Tabs></>}
+      <Box component="main" role={host ? "tabpanel" : undefined} id={`panel-${page}`} aria-labelledby={host ? `tab-${page}` : undefined} sx={{ flex: 1, minHeight: 0, p: host ? { xs: 2, sm: 3 } : 0, position: "relative", overflow: "hidden" }}>
         {loading ? <Box sx={{ height: "100%", display: "grid", placeItems: "center" }}><CircularProgress/></Box> : startupError ? <Box sx={{ height: "100%", display: "grid", placeItems: "center", p: 3 }}><Stack alignItems="center" spacing={2}><Typography variant="h6" color="error">无法加载本地数据</Typography><Typography color="text.secondary">{startupError}</Typography><Button variant="contained" onClick={() => window.location.reload()}>重新加载</Button></Stack></Box> : !host ? <EmptyState onAdd={openAddHost}/> : <>
-          {hosts.filter((item) => item.status === "connected").map((item) => {
+          <React.Suspense fallback={<CircularProgress aria-label="正在打开终端" size={28}/>}>{hosts.filter((item) => item.status === "connected" && terminalHostIds.includes(item.id)).map((item) => {
             const active = page === "terminal" && item.id === host.id;
-            return <Box key={item.id} aria-hidden={!active} sx={{ position: active ? "relative" : "absolute", inset: active ? undefined : 0, height: "100%", visibility: active ? "visible" : "hidden", pointerEvents: active ? "auto" : "none" }}><TerminalView host={item} active={active}/></Box>;
-          })}
+            return <Box key={item.id} aria-hidden={!active} inert={!active} sx={{ position: active ? "relative" : "absolute", inset: active ? undefined : 0, height: "100%", visibility: active ? "visible" : "hidden", pointerEvents: active ? "auto" : "none" }}><TerminalView host={item} active={active}/></Box>;
+          })}</React.Suspense>
           <React.Suspense fallback={<Box sx={{ height: "100%", display: "grid", placeItems: "center" }}><CircularProgress size={28}/></Box>}>
-            {page === "terminal" && host.status !== "connected" ? <DisconnectedTerminal/> : page === "monitor" ? <MonitorView host={host}/> : page === "firewall" ? <FirewallView host={host}/> : page === "sftp" ? <SftpView host={host}/> : page === "forwarding" ? <ForwardingView host={host}/> : null}
+            {page === "terminal" && host.status !== "connected" ? <DisconnectedTerminal/> : page === "monitor" ? <MonitorView key={host.id} host={host}/> : page === "firewall" ? <FirewallView key={host.id} host={host}/> : page === "sftp" ? <SftpView key={host.id} host={host}/> : page === "forwarding" ? <ForwardingView key={host.id} host={host}/> : null}
           </React.Suspense>
         </>}
       </Box>
       <TransferDrawer/><CommandLedger/>
     </Box></Box>
     <HostDialog open={hostDialog} initialHost={editingHost} onClose={() => { setHostDialog(false); setEditingHost(undefined); }}/>
-    <Dialog open={Boolean(confirmAction)} onClose={() => setConfirmAction(null)} maxWidth="sm" fullWidth>
+    <Dialog open={Boolean(confirmAction)} onClose={actionPending ? undefined : () => setConfirmAction(null)} maxWidth="sm" fullWidth>
       <DialogTitle>{confirmAction?.kind === "delete" ? "删除服务器" : "编辑已连接服务器"}</DialogTitle>
       <DialogContent>{confirmAction?.kind === "delete" ? <Typography>确定删除“{confirmAction.host.name}”吗？服务器配置、凭据、转发和监控历史将被删除，但命令审计记录会保留。</Typography> : <Typography>编辑连接参数前需要断开“{confirmAction?.host.name}”的当前 SSH 会话。是否继续？</Typography>}</DialogContent>
-      <DialogActions><Button onClick={() => setConfirmAction(null)}>取消</Button><Button color={confirmAction?.kind === "delete" ? "error" : "primary"} variant="contained" onClick={() => void executeConfirmedAction()}>{confirmAction?.kind === "delete" ? "确认删除" : "断开并编辑"}</Button></DialogActions>
+      <DialogActions><Button disabled={actionPending} onClick={() => setConfirmAction(null)}>取消</Button><Button disabled={actionPending} color={confirmAction?.kind === "delete" ? "error" : "primary"} variant="contained" onClick={() => void executeConfirmedAction()}>{confirmAction?.kind === "delete" ? "确认删除" : "断开并编辑"}</Button></DialogActions>
     </Dialog>
     <Dialog open={Boolean(passwordRequest)} onClose={() => finishPasswordRequest()} maxWidth="xs" fullWidth>
       <DialogTitle>输入 SSH 密码</DialogTitle>
