@@ -21,6 +21,7 @@ interface AppState {
   settings: AppSettings | undefined;
   setHosts: (hosts: HostProfile[]) => void;
   upsertHost: (host: HostProfile, select?: boolean) => void;
+  updateHostConnection: (id: string, patch: Pick<HostProfile, "status"> & Partial<Pick<HostProfile, "lastConnectedAt">>) => void;
   removeHost: (id: string) => void;
   selectHost: (id?: string) => void;
   setPage: (page: PageId) => void;
@@ -72,6 +73,7 @@ export const useAppStore = create<AppState>((set) => ({
     window.localStorage.setItem("command-panel-open", String(commandPanelOpen));
     return { commandPanelOpen };
   }),
+  updateHostConnection: (id, patch) => set((s) => ({ hosts: s.hosts.map((host) => host.id === id ? { ...host, ...patch } : host) })),
   setCommandPanelHeight: (commandPanelHeight) => {
     const next = Math.max(140, Math.min(500, Number.isFinite(commandPanelHeight) ? commandPanelHeight : 216));
     window.localStorage.setItem("command-panel-height", String(next));

@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
-import { fireEvent, render, screen } from "@testing-library/react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useAppStore } from "../store";
 import type { AppSettings } from "../types";
 import SettingsView from "./SettingsView";
@@ -33,8 +33,10 @@ const settings: AppSettings = {
 
 describe("SettingsView", () => {
   beforeEach(() => {
+    apiMocks.settingsUpdate.mockReset().mockImplementation(async (value: AppSettings) => value);
     useAppStore.setState({ settings });
   });
+  afterEach(cleanup);
 
   it("renders as a dialog and can close without changing workspace state", () => {
     const onClose = vi.fn();
@@ -47,5 +49,20 @@ describe("SettingsView", () => {
     expect(onClose).toHaveBeenCalledOnce();
     expect(useAppStore.getState().page).toBe("terminal");
     expect(useAppStore.getState().selectedHostId).toBe("host-1");
+  });
+
+  it("keeps a requested close pending only until a failed save can be shown", async () => {
+    let reject!: (reason: Error) => void;
+    apiMocks.settingsUpdate.mockReturnValue(new Promise<AppSettings>((_, fail) => { reject = fail; }));
+    const onClose = vi.fn();
+    render(<SettingsView open onClose={onClose} onTheme={vi.fn()}/>);
+    fireEvent.click(screen.getByRole("tab", { name: "终端" }));
+    fireEvent.click(screen.getByRole("switch", { name: "粘贴前确认" }));
+    fireEvent.click(screen.getByRole("button", { name: "关闭设置" }));
+    expect(onClose).not.toHaveBeenCalled();
+    await act(async () => reject(new Error("disk full")));
+    expect(await screen.findByText("disk full")).toBeTruthy();
+    expect(onClose).not.toHaveBeenCalled();
+    expect(useAppStore.getState().settings?.terminalPasteProtection).toBe(true);
   });
 });

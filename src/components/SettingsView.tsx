@@ -6,7 +6,7 @@ import SettingsRounded from "@mui/icons-material/SettingsRounded";
 import { Alert, Box, Button, CardContent, Chip, Dialog, DialogContent, DialogTitle, Divider, FormControl, FormControlLabel, IconButton, InputLabel, MenuItem, Select, Slider, Stack, Switch, Tab, Tabs, TextField, Typography } from "@mui/material";
 import React from "react";
 import { useTranslation } from "react-i18next";
-import { api } from "../api";
+import { settingsPersistence } from "../settingsPersistence";
 import { commandMatchesSuppression } from "../commandSuppression";
 import { useAppStore } from "../store";
 import type { AppSettings, CommandSuppressionRule } from "../types";
@@ -21,60 +21,53 @@ interface SettingsViewProps {
 export default function SettingsView({ open, onClose, onTheme }: SettingsViewProps) {
   const { i18n } = useTranslation();
   const settings = useAppStore((state) => state.settings);
-  const setSettings = useAppStore((state) => state.setSettings);
   const [section, setSection] = React.useState(0);
   const [saving, setSaving] = React.useState(false);
   const [saved, setSaved] = React.useState(false);
   const [error, setError] = React.useState("");
   const pendingWrites = React.useRef(0);
+  const writesFailed = React.useRef(false);
   const closeRequested = React.useRef(false);
-  const saveChain = React.useRef<Promise<unknown>>(Promise.resolve());
+  const [fontSizeDraft, setFontSizeDraft] = React.useState<number>();
+
+  React.useEffect(() => {
+    if (!settings) return;
+    onTheme(settings.theme);
+  }, [onTheme, settings?.theme]);
+  React.useEffect(() => {
+    if (!settings) return;
+    void i18n.changeLanguage(settings.locale);
+    localStorage.setItem("locale", settings.locale);
+  }, [i18n, settings?.locale]);
 
   const finishWrite = (success = true) => {
+    if (!success) writesFailed.current = true;
     pendingWrites.current = Math.max(0, pendingWrites.current - 1);
     if (pendingWrites.current === 0) {
       setSaving(false);
-      if (success) setSaved(true);
+      if (!writesFailed.current) setSaved(true);
       window.setTimeout(() => setSaved(false), 1200);
-      if (closeRequested.current) {
+      if (closeRequested.current && !writesFailed.current) {
         closeRequested.current = false;
         onClose();
       }
+      if (writesFailed.current) closeRequested.current = false;
     }
-  };
-
-  const persist = (next: AppSettings) => {
-    if (!settings) return;
-    const previous = settings;
-    setSettings(next);
-    pendingWrites.current += 1;
-    setSaving(true);
-    saveChain.current = saveChain.current
-      .catch(() => undefined)
-      .then(() => api.settingsUpdate(next))
-      .then((saved) => {
-        if (useAppStore.getState().settings === next) setSettings(saved);
-        finishWrite(true);
-      }, (reason) => {
-        if (useAppStore.getState().settings === next) {
-          setSettings(previous);
-          if (next.theme !== previous.theme) onTheme(previous.theme);
-          if (next.locale !== previous.locale) { void i18n.changeLanguage(previous.locale); localStorage.setItem("locale", previous.locale); }
-        }
-        setError(formatError(reason));
-        finishWrite(false);
-      });
   };
 
   const update = (patch: Partial<AppSettings>) => {
     if (!settings) return;
-    const next = { ...settings, ...patch };
-    persist(next);
-    if (patch.theme) onTheme(patch.theme);
-    if (patch.locale) {
-      void i18n.changeLanguage(patch.locale);
-      localStorage.setItem("locale", patch.locale);
-    }
+    if (pendingWrites.current === 0) writesFailed.current = false;
+    pendingWrites.current += 1;
+    setSaving(true);
+    setSaved(false);
+    setError("");
+    void settingsPersistence.update(patch).then(() => {
+        finishWrite(true);
+      }, (reason) => {
+        setError(formatError(reason));
+        finishWrite(false);
+      });
   };
 
   const requestClose = () => {
@@ -86,17 +79,12 @@ export default function SettingsView({ open, onClose, onTheme }: SettingsViewPro
   };
 
   const reset = () => {
+    if (pendingWrites.current === 0) writesFailed.current = false;
     pendingWrites.current += 1;
     setSaving(true);
-    saveChain.current = saveChain.current
-      .catch(() => undefined)
-      .then(() => api.settingsReset())
-      .then((next) => {
-        setSettings(next);
-        onTheme(next.theme);
-        void i18n.changeLanguage(next.locale); localStorage.setItem("locale", next.locale);
-      })
-      .then(() => finishWrite(true), (reason) => { setError(formatError(reason)); finishWrite(false); });
+    setSaved(false);
+    setError("");
+    void settingsPersistence.reset().then(() => finishWrite(true), (reason) => { setError(formatError(reason)); finishWrite(false); });
   };
 
   return <Dialog open={open} onClose={requestClose} fullWidth maxWidth="md" slotProps={{ paper: { sx: { width: 860, maxHeight: "80vh", borderRadius: "28px" } } }}>
@@ -123,7 +111,7 @@ export default function SettingsView({ open, onClose, onTheme }: SettingsViewPro
           <FormControl fullWidth><InputLabel id="settings-default-page">默认页面</InputLabel><Select labelId="settings-default-page" label="默认页面" value={settings.defaultPage} onChange={(event) => update({ defaultPage: event.target.value as AppSettings["defaultPage"] })}><MenuItem value="monitor">资源监控</MenuItem><MenuItem value="terminal">终端</MenuItem><MenuItem value="sftp">文件管理</MenuItem></Select></FormControl>
         </Stack>}
         {section === 1 && <Stack spacing={2} maxWidth={680}>
-          <Typography>字体大小：{settings.terminalFontSize}px</Typography><Slider aria-label="终端字号" value={settings.terminalFontSize} min={11} max={22} step={1} onChange={(_, value) => setSettings({ ...settings, terminalFontSize: value as number })} onChangeCommitted={(_, value) => update({ terminalFontSize: value as number })}/>
+          <Typography>字体大小：{fontSizeDraft ?? settings.terminalFontSize}px</Typography><Slider aria-label="终端字号" value={fontSizeDraft ?? settings.terminalFontSize} min={11} max={22} step={1} onChange={(_, value) => setFontSizeDraft(value as number)} onChangeCommitted={(_, value) => { setFontSizeDraft(undefined); update({ terminalFontSize: value as number }); }}/>
           <TextField label="滚动缓冲行数" type="number" value={settings.terminalScrollback} onChange={(event) => update({ terminalScrollback: Math.max(100, Number(event.target.value)) })}/>
           <FormControlLabel control={<Switch checked={settings.terminalPasteProtection} onChange={(event) => update({ terminalPasteProtection: event.target.checked })}/>} label="粘贴前确认"/>
           <FormControlLabel control={<Switch checked={settings.terminalCommandLogging} onChange={(event) => update({ terminalCommandLogging: event.target.checked })}/>} label="记录终端命令（隐私保护）"/>

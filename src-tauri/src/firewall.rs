@@ -10,6 +10,40 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use uuid::Uuid;
 
+// Every privileged read must propagate its failure. A trailing capability
+// probe must never turn a permission error into an empty, successful ruleset.
+const READ_COMMAND: &str = r#"LANG=C; export LANG
+as_root() { if [ "$(id -u)" -eq 0 ]; then "$@"; else sudo -n "$@"; fi; }
+ufw_status=
+if command -v ufw >/dev/null 2>&1; then
+    ufw_status=$(as_root ufw status) || exit 1
+fi
+if printf '%s\n' "$ufw_status" | grep -q '^Status: active'; then
+    backend=ufw
+elif command -v firewall-cmd >/dev/null 2>&1 && as_root firewall-cmd --state >/dev/null 2>&1; then
+    backend=firewalld
+elif [ -n "$ufw_status" ]; then
+    backend=ufw
+elif command -v nft >/dev/null 2>&1; then
+    backend=nftables
+else backend=unsupported
+fi
+echo "$backend"
+case "$backend" in
+ufw)
+    echo __UFW_VERBOSE__; as_root ufw status verbose || exit 1
+    echo __UFW_NUMBERED__; as_root ufw status numbered || exit 1
+    ;;
+firewalld)
+    printf '__FIREWALLD_DEFAULT__:'; as_root firewall-cmd --get-default-zone || exit 1
+    as_root firewall-cmd --list-all-zones || exit 1
+    echo __FIREWALLD_DIRECT__; as_root firewall-cmd --direct --get-all-rules || exit 1
+    ;;
+nftables) as_root nft list ruleset || exit 1 ;;
+esac
+echo __ROLLBACK__
+if [ "$backend" != unsupported ] && [ "$backend" != nftables ] && command -v flock >/dev/null 2>&1 && { { command -v systemd-run >/dev/null 2>&1 && [ -d /run/systemd/system ]; } || { command -v at >/dev/null 2>&1 && pgrep -x atd >/dev/null 2>&1; }; }; then echo yes; else echo no; fi"#;
+
 #[derive(Clone)]
 struct StoredPlan {
     plan: FirewallPlan,
@@ -34,20 +68,44 @@ impl Default for FirewallManager {
 }
 
 impl FirewallManager {
+    #[cfg(test)]
+    pub(crate) fn live_test_rollback_unit(&self, plan_id: &str) -> Option<String> {
+        self.plans.read().get(plan_id).and_then(|plan| plan.rollback_unit.clone())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn live_test_fail_after_mutation(&self, plan_id: &str) {
+        self.plans.write().get_mut(plan_id).unwrap().plan.commands[0].push_str(" && false");
+    }
+
+    #[cfg(test)]
+    pub(crate) fn live_test_use_scheduler(&self, plan_id: &str, scheduler: &str) {
+        assert!(matches!(scheduler, "systemd" | "at"));
+        self.plans.write().get_mut(plan_id).unwrap().scheduler = scheduler.into();
+    }
+
     pub fn plan_host(&self, plan_id: &str) -> Option<String> {
         self.plans.read().get(plan_id).map(|stored| stored.plan.host_id.clone())
     }
 
+    #[cfg(test)]
     pub async fn read(&self, ssh: &SshManager, host_id: &str) -> AppResult<FirewallState> {
-        let detect = "LANG=C sh -c 'if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q Status; then echo ufw; echo __UFW_VERBOSE__; sudo -n ufw status verbose 2>/dev/null || ufw status verbose; echo __UFW_NUMBERED__; sudo -n ufw status numbered 2>/dev/null || ufw status numbered; elif command -v firewall-cmd >/dev/null && firewall-cmd --state >/dev/null 2>&1; then echo firewalld; sudo -n firewall-cmd --list-all --zone=$(firewall-cmd --get-default-zone); elif command -v nft >/dev/null; then echo nftables; sudo -n nft list ruleset 2>/dev/null || nft list ruleset; else echo unsupported; fi; echo __ROLLBACK__; if command -v systemd-run >/dev/null || command -v at >/dev/null; then echo yes; else echo no; fi'";
-        let out = ssh.exec(host_id, detect).await?;
+        self.read_with_password(ssh, host_id, None).await
+    }
+
+    pub async fn read_with_password(&self, ssh: &SshManager, host_id: &str, sudo_password: Option<&str>) -> AppResult<FirewallState> {
+        let command = firewall_read_command(sudo_password.is_some())?;
+        let out = ssh.exec_with_input(host_id, &command, sudo_password).await?;
+        if out.exit_code != 0 {
+            return Err(firewall_read_error(&out, sudo_password.is_some()));
+        }
         let before = out.stdout.split("__ROLLBACK__").next().unwrap_or("");
         let rollback = out
             .stdout
             .split("__ROLLBACK__")
             .nth(1)
             .unwrap_or("")
-            .contains("yes");
+            .trim() == "yes";
         let mut lines = before.lines();
         let backend = lines.next().unwrap_or("unsupported").trim().to_string();
         let raw = lines.collect::<Vec<_>>().join("\n");
@@ -74,11 +132,22 @@ impl FirewallManager {
             rules,
         })
     }
+    #[cfg(test)]
     pub async fn plan(
         &self,
         ssh: &SshManager,
         host_id: &str,
         change: FirewallChange,
+    ) -> AppResult<FirewallPlan> {
+        self.plan_with_password(ssh, host_id, change, None).await
+    }
+
+    pub async fn plan_with_password(
+        &self,
+        ssh: &SshManager,
+        host_id: &str,
+        change: FirewallChange,
+        sudo_password: Option<&str>,
     ) -> AppResult<FirewallPlan> {
         if change.operation != "add" && change.operation != "delete" { return Err(AppError::Validation("防火墙操作必须是 add 或 delete".into())); }
         validate_rule(&change.rule)?;
@@ -91,7 +160,7 @@ impl FirewallManager {
             operation: change.operation,
             rule,
         };
-        let state = self.read(ssh, host_id).await?;
+        let state = self.read_with_password(ssh, host_id, sudo_password).await?;
         if !state.rollback_available {
             return Err(AppError::Permission(
                 "服务器没有 systemd-run、at 或防火墙原生回滚机制".into(),
@@ -172,7 +241,7 @@ impl FirewallManager {
     }
 
     async fn scheduler(&self, ssh: &SshManager, host_id: &str) -> AppResult<String> {
-        let output = ssh.exec(host_id, "if ! command -v flock >/dev/null 2>&1; then echo none; elif command -v systemd-run >/dev/null 2>&1; then echo systemd; elif command -v at >/dev/null 2>&1; then echo at; else echo none; fi").await?;
+        let output = ssh.exec(host_id, "if ! command -v flock >/dev/null 2>&1; then echo none; elif command -v systemd-run >/dev/null 2>&1 && [ -d /run/systemd/system ]; then echo systemd; elif command -v at >/dev/null 2>&1 && pgrep -x atd >/dev/null 2>&1; then echo at; else echo none; fi").await?;
         let scheduler = output.stdout.lines().find(|line| matches!(line.trim(), "systemd" | "at" | "none")).unwrap_or("none").trim().to_owned();
         if scheduler == "none" { return Err(AppError::Permission("安全回滚需要 flock 和 systemd-run 或 at".into())); }
         Ok(scheduler)
@@ -193,6 +262,9 @@ impl FirewallManager {
             let elevated = if sudo_password.is_some() { check.replace("sudo -n", "sudo -S -p ''") } else { check };
             let input = sudo_password.map(|password| sudo_input_for(&elevated, password));
             let output = ssh.exec_with_input(&host_id, &elevated, input.as_deref()).await?;
+            if output.exit_code != 0 && output.stderr.to_ascii_lowercase().contains("sudo:") {
+                return Err(firewall_read_error(&output, sudo_password.is_some()));
+            }
             if output.exit_code == 0 { self.plans.write().remove(&id); }
         }
         let stored = {
@@ -225,7 +297,7 @@ impl FirewallManager {
         {
             return Err(AppError::StalePlan);
         }
-        let current = self.read(ssh, &stored.plan.host_id).await?;
+        let current = self.read_with_password(ssh, &stored.plan.host_id, sudo_password).await?;
         if current.state_hash != stored.plan.state_hash {
             return Err(AppError::StalePlan);
         }
@@ -233,19 +305,40 @@ impl FirewallManager {
         // would then delete a rule that predates this change.
         if stored.backend == "firewalld" {
             for command in stored.plan.commands.iter().flat_map(|command| command.split(" && ")) {
-                if command.contains("--add-rich-rule=") || command.contains("--add-rule ") {
-                    let query = command.replace("--add-rich-rule=", "--query-rich-rule=").replace("--add-rule ", "--query-rule ");
+                if command.contains("--add-") {
+                    let query = firewalld_rule_operation(command, "query")?;
                     let elevated = if sudo_password.is_some() { query.replace("sudo -n", "sudo -S -p ''") } else { query };
                     let input = sudo_password.map(|password| sudo_input_for(&elevated, password));
                     let output = ssh.exec_with_input(&stored.plan.host_id, &elevated, input.as_deref()).await?;
                     if output.exit_code == 0 { return Err(AppError::Validation("规则已经存在，已拒绝重复添加以保护原规则".into())); }
                     if output.exit_code != 1 || output.stdout.trim() != "no" {
-                        if sudo_password.is_none() && output.stderr.contains("sudo") { return Err(AppError::SudoRequired); }
-                        return Err(AppError::Permission(meaningful_firewall_error(&output.stdout, &output.stderr)));
+                        return Err(firewall_read_error(&output, sudo_password.is_some()));
                     }
                 }
             }
         }
+        // Runtime and permanent firewalld configurations are independent. A
+        // multi-command commit can fail after writing only some permanent
+        // rules, so capture each rule's original permanent presence before
+        // scheduling rollback. Never derive this from its runtime presence.
+        let mut permanent_restore = Vec::new();
+        if let Some(persist) = stored.persist_command.as_deref() {
+            for command in persist.split(" && ") {
+                let query = firewalld_rule_operation(command, "query")?;
+                let elevated = if sudo_password.is_some() { query.replace("sudo -n", "sudo -S -p ''") } else { query };
+                let input = sudo_password.map(|password| sudo_input_for(&elevated, password));
+                let output = ssh.exec_with_input(&stored.plan.host_id, &elevated, input.as_deref()).await?;
+                let present = match (output.exit_code, output.stdout.trim()) {
+                    (0, "yes") => true,
+                    (1, "no") => false,
+                    _ => {
+                        return Err(firewall_read_error(&output, sudo_password.is_some()));
+                    }
+                };
+                permanent_restore.push(firewalld_rule_operation(command, if present { "add" } else { "remove" })?.replace("sudo -n ", ""));
+            }
+        }
+        let permanent_restore = if permanent_restore.is_empty() { "true".to_owned() } else { permanent_restore.join(" && ") };
         let unit = format!("sshops-rollback-{}", Uuid::new_v4());
         // /run is root-owned; an unprivileged local account cannot pre-create
         // a snapshot symlink or forge the at scheduler's commit marker.
@@ -271,18 +364,21 @@ impl FirewallManager {
         };
         let rollback_restore = locked_rollback_command(&unit, &rollback_restore)?;
         let schedule = if stored.scheduler == "systemd" {
-            format!("sudo -n systemd-run --unit={unit} --on-active=60s /bin/sh -c {}", shell_quote(&rollback_restore)?)
+            // systemd timers otherwise default to a one-minute coalescing
+            // window, which can leave a promised 60-second rollback pending
+            // for almost two minutes.
+            format!("sudo -n systemd-run --unit={unit} --on-active=60s --timer-property=AccuracySec=1s --timer-property=RandomizedDelaySec=0 /bin/sh -c {}", shell_quote(&rollback_restore)?)
         } else {
             at_schedule_command(&unit, &rollback_restore)?
         };
         let deadline = format!("sudo -n sh -c {}", shell_quote(&format!("echo $(( $(date +%s) + 60 )) > {workspace}/deadline"))?);
-        let prepare = format!("{rollback} && {deadline} && {schedule}");
+        let save_permanent = format!("sudo -n sh -c {}", shell_quote(&format!("umask 077; printf '%s\\n' {} > {workspace}/permanent-restore", shell_quote(&permanent_restore)?))?);
+        let prepare = format!("{rollback} && {save_permanent} && {deadline} && {schedule}");
         let elevated = if sudo_password.is_some() { prepare.replace("sudo -n", "sudo -S -p ''") } else { prepare.clone() };
         let sudo_input = sudo_password.map(|password| sudo_input_for(&elevated, password));
         let prepared = ssh.exec_with_input(&stored.plan.host_id, &elevated, sudo_input.as_deref()).await?;
         if prepared.exit_code != 0 {
-            if sudo_password.is_none() && prepared.stderr.contains("sudo") { return Err(AppError::SudoRequired); }
-            return Err(AppError::Permission(meaningful_firewall_error(&prepared.stdout, &prepared.stderr)));
+            return Err(firewall_read_error(&prepared, sudo_password.is_some()));
         }
         let rollback_deadline = (rollback_started + chrono::Duration::seconds(60)).to_rfc3339();
         if let Some(plan) = self.plans.write().get_mut(&stored.plan.id) {
@@ -296,13 +392,7 @@ impl FirewallManager {
         let output = ssh.exec_with_input(&stored.plan.host_id, &elevated, input.as_deref()).await?;
         log(db, ssh, &stored.plan.host_id, "firewall", command, &output);
         if output.exit_code != 0 {
-            let rollback_command = if stored.scheduler == "systemd" {
-                format!("sudo -n systemctl stop {unit}.timer && sudo -n systemctl start {unit}.service")
-            } else {
-                let snapshot = format!("/run/{unit}/snapshot");
-                let restore = match stored.backend.as_str() { "ufw" => format!("tar -C / -xzf {snapshot} && ufw reload"), "firewalld" => stored.rollback_restore.clone().unwrap_or_else(|| "false".to_owned()), "nftables" => format!("nft -f {snapshot}"), _ => "true".to_owned() };
-                format!("sudo -n sh -c {}", shell_quote(&locked_rollback_command(&unit, &restore)?)?)
-            };
+            let rollback_command = immediate_rollback_command(&stored, &unit)?;
             let rollback_elevated = if sudo_password.is_some() { rollback_command.replace("sudo -n", "sudo -S -p ''") } else { rollback_command };
             let rollback_input = sudo_password.map(|password| sudo_input_for(&rollback_elevated, password));
             let rollback_result = ssh.exec_with_input(&stored.plan.host_id, &rollback_elevated, rollback_input.as_deref()).await;
@@ -312,13 +402,7 @@ impl FirewallManager {
         let verification = tokio::time::timeout(std::time::Duration::from_secs(15), ssh.verify_new_connection(db, &stored.plan.host_id)).await
             .unwrap_or_else(|_| Err(AppError::Ssh("验证新的 SSH 连接超时".into())));
         if let Err(error) = verification {
-            let rollback_command = if stored.scheduler == "systemd" {
-                format!("sudo -n systemctl stop {unit}.timer && sudo -n systemctl start {unit}.service")
-            } else {
-                let snapshot = format!("/run/{unit}/snapshot");
-                let restore = match stored.backend.as_str() { "ufw" => format!("tar -C / -xzf {snapshot} && ufw reload"), "firewalld" => stored.rollback_restore.clone().unwrap_or_else(|| "false".to_owned()), "nftables" => format!("nft -f {snapshot}"), _ => "true".to_owned() };
-                format!("sudo -n sh -c {}", shell_quote(&locked_rollback_command(&unit, &restore)?)?)
-            };
+            let rollback_command = immediate_rollback_command(&stored, &unit)?;
             let rollback_elevated = if sudo_password.is_some() { rollback_command.replace("sudo -n", "sudo -S -p ''") } else { rollback_command };
             let rollback_input = sudo_password.map(|password| sudo_input_for(&rollback_elevated, password));
             let rollback_result = ssh.exec_with_input(&stored.plan.host_id, &rollback_elevated, rollback_input.as_deref()).await;
@@ -358,7 +442,7 @@ impl FirewallManager {
             let elevated = if sudo_password.is_some() { cmd.replace("sudo -n", "sudo -S -p ''") } else { cmd };
             let input = sudo_password.map(|password| sudo_input_for(&elevated, password));
             let out = ssh.exec_with_input(&stored.plan.host_id, &elevated, input.as_deref()).await?;
-            if out.exit_code != 0 { return Err(AppError::Permission(meaningful_firewall_error(&out.stdout, &out.stderr))); }
+            if out.exit_code != 0 { return Err(firewall_read_error(&out, sudo_password.is_some())); }
         }
         self.plans.write().remove(plan_id);
         Ok(())
@@ -376,23 +460,50 @@ impl FirewallManager {
         result
     }
     async fn rollback_inner(&self, ssh: &SshManager, plan_id: &str, stored: StoredPlan, sudo_password: Option<&str>) -> AppResult<()> {
-        if let Some(unit) = stored.rollback_unit {
-            let cmd = if stored.scheduler == "systemd" {
-                format!("sudo -n systemctl stop {unit}.timer 2>/dev/null || true; sudo -n systemctl start {unit}.service")
-            } else {
-                let snapshot = format!("/run/{unit}/snapshot");
-                let restore = match stored.backend.as_str() { "ufw" => format!("tar -C / -xzf {snapshot} && ufw reload"), "firewalld" => stored.rollback_restore.clone().unwrap_or_else(|| "false".to_owned()), "nftables" => format!("nft -f {snapshot}"), _ => "true".to_owned() };
-                format!("sudo -n sh -c {}", shell_quote(&locked_rollback_command(&unit, &restore)?)?)
-            };
+        if let Some(unit) = stored.rollback_unit.as_deref() {
+            // Starting a systemd service can return before its work finishes.
+            // Execute the same locked restore synchronously, retaining the
+            // plan until restoration finishes; the timer remains idempotent.
+            let cmd = immediate_rollback_command(&stored, unit)?;
             let elevated = if sudo_password.is_some() { cmd.replace("sudo -n", "sudo -S -p ''") } else { cmd };
             let input = sudo_password.map(|password| sudo_input_for(&elevated, password));
             let out = ssh.exec_with_input(&stored.plan.host_id, &elevated, input.as_deref()).await?;
-            if out.exit_code != 0 { return Err(AppError::Other(out.stderr)); }
+            if out.exit_code != 0 { return Err(firewall_read_error(&out, sudo_password.is_some())); }
         }
         self.plans.write().remove(plan_id);
         Ok(())
     }
 }
+fn firewall_read_command(with_password: bool) -> AppResult<String> {
+    if !with_password { return Ok(READ_COMMAND.into()); }
+    // Elevate the whole read once. Each inner as_root invocation now runs as
+    // root, so no repeated sudo prompt can consume a second password line.
+    // READ_COMMAND is a trusted compile-time script containing newlines.
+    // Keep the stricter shell_quote validation for every user-supplied value.
+    let quoted_script = format!("'{}'", READ_COMMAND.replace('\'', "'\"'\"'"));
+    Ok(format!("LANG=C; export LANG; if [ \"$(id -u)\" -eq 0 ]; then {READ_COMMAND}\nelse sudo -S -p '' sh -c {quoted_script}; fi"))
+}
+
+fn firewall_read_error(output: &ExecOutput, supplied_password: bool) -> AppError {
+    let stderr = output.stderr.to_ascii_lowercase();
+    let sudo_error = stderr.lines().any(|line| line.trim_start().starts_with("sudo:"));
+    if sudo_error {
+        if stderr.contains("incorrect password attempt") || stderr.contains("sorry, try again")
+            || (supplied_password && stderr.contains("no password was provided"))
+        {
+            // Never relay arbitrary authentication output alongside a secret;
+            // the stable error kind allows replacing an expired saved secret.
+            return AppError::SudoAuthenticationFailed("密码不正确或验证失败，请重新输入".into());
+        }
+        if stderr.contains("a password is required") || stderr.contains("no password was provided")
+            || stderr.contains("a terminal is required to read the password")
+        {
+            return AppError::SudoRequired;
+        }
+    }
+    AppError::Permission(meaningful_firewall_error(&output.stdout, &output.stderr))
+}
+
 fn meaningful_firewall_error(stdout: &str, stderr: &str) -> String {
     let lines = stderr.lines().chain(stdout.lines()).filter(|line| {
         let line = line.trim();
@@ -406,8 +517,32 @@ fn sudo_input_for(command: &str, password: &str) -> String {
     std::iter::repeat_n(password, count).collect::<Vec<_>>().join("\n")
 }
 
+fn firewalld_rule_operation(command: &str, operation: &str) -> AppResult<String> {
+    for kind in ["rich-rule=", "port=", "rule "] {
+        for current in ["add", "remove"] {
+            let flag = format!("--{current}-{kind}");
+            if command.contains(&flag) {
+                return Ok(command.replacen(&flag, &format!("--{operation}-{kind}"), 1));
+            }
+        }
+    }
+    Err(AppError::Validation("无法识别 firewalld 规则命令".into()))
+}
+
+fn immediate_rollback_command(stored: &StoredPlan, unit: &str) -> AppResult<String> {
+    let snapshot = format!("/run/{unit}/snapshot");
+    let restore = match stored.backend.as_str() {
+        "ufw" => format!("tar -C / -xzf {snapshot} && ufw reload"),
+        "firewalld" => stored.rollback_restore.clone().ok_or_else(|| AppError::Validation("缺少 firewalld 回滚命令".into()))?,
+        _ => return Err(AppError::Validation("不支持的防火墙".into())),
+    };
+    Ok(format!("sudo -n {}", locked_rollback_command(unit, &restore)?))
+}
+
 fn at_schedule_command(unit: &str, restore: &str) -> AppResult<String> {
-    let job = format!("sleep 60; if [ ! -f /run/{unit}/committed ]; then {restore}; fi\n");
+    // atd may pick up `at now` on its next polling cycle. Sleep only until
+    // the existing transaction deadline, not another full minute afterward.
+    let job = format!("deadline=$(cat /run/{unit}/deadline) || exit 1; now=$(date +%s) || exit 1; remaining=$((deadline - now)); if [ \"$remaining\" -gt 0 ]; then sleep \"$remaining\"; fi; if [ ! -f /run/{unit}/committed ]; then {restore}; fi\n");
     // Keep the job pipe inside the privileged shell so sudo's password is
     // read from SSH stdin, never from the script being submitted to at.
     let script = format!("printf '%s\\n' {} | at now", shell_quote(job.trim_end())?);
@@ -416,19 +551,19 @@ fn at_schedule_command(unit: &str, restore: &str) -> AppResult<String> {
 
 fn locked_rollback_command(unit: &str, restore: &str) -> AppResult<String> {
     let root = format!("/run/{unit}");
-    let script = format!("if [ ! -f {root}/committed ] && [ ! -f {root}/rolled-back ]; then touch {root}/rollback-started && {{ if [ -f {root}/mutation-started ]; then {restore}; fi; }} && touch {root}/rolled-back; fi");
+    let script = format!("if [ ! -f {root}/committed ] && [ ! -f {root}/rolled-back ]; then touch {root}/rollback-started || exit 1; rollback_status=0; if [ -f {root}/persistence-started ]; then /bin/sh {root}/permanent-restore || rollback_status=1; fi; if [ -f {root}/mutation-started ]; then {{ {restore}; }} || rollback_status=1; fi; [ \"$rollback_status\" -eq 0 ] && touch {root}/rolled-back; fi");
     Ok(format!("flock -x {root}/lock /bin/sh -c {}", shell_quote(&script)?))
 }
 
 fn locked_commit_command(unit: &str, persist: &str) -> AppResult<String> {
     let root = format!("/run/{unit}");
-    let script = format!("deadline=$(cat {root}/deadline) || exit 1; now=$(date +%s) || exit 1; if [ ! -f {root}/rollback-started ] && [ \"$now\" -lt \"$deadline\" ]; then {persist} && touch {root}/committed; else echo 'Rollback deadline expired or rollback already started' >&2; exit 1; fi");
+    let script = format!("if [ -f {root}/committed ]; then exit 0; fi; deadline=$(cat {root}/deadline) || exit 1; now=$(date +%s) || exit 1; if [ -f {root}/apply-completed ] && [ ! -f {root}/rollback-started ] && [ \"$now\" -lt \"$deadline\" ]; then touch {root}/persistence-started && {persist} && touch {root}/committed; else echo 'Firewall apply incomplete, rollback deadline expired or rollback already started' >&2; exit 1; fi");
     Ok(format!("flock -x {root}/lock /bin/sh -c {}", shell_quote(&script)?))
 }
 
 fn locked_apply_command(unit: &str, command: &str) -> AppResult<String> {
     let root = format!("/run/{unit}");
-    let script = format!("deadline=$(cat {root}/deadline) || exit 1; now=$(date +%s) || exit 1; if [ ! -f {root}/rollback-started ] && [ \"$now\" -lt \"$deadline\" ]; then touch {root}/mutation-started && {command}; else echo 'Firewall apply deadline expired' >&2; exit 1; fi");
+    let script = format!("deadline=$(cat {root}/deadline) || exit 1; now=$(date +%s) || exit 1; if [ ! -f {root}/mutation-started ] && [ ! -f {root}/committed ] && [ ! -f {root}/rollback-started ] && [ \"$now\" -lt \"$deadline\" ]; then touch {root}/mutation-started && {command} && touch {root}/apply-completed; else echo 'Firewall apply already started or deadline expired' >&2; exit 1; fi");
     Ok(format!("flock -x {root}/lock /bin/sh -c {}", shell_quote(&script)?))
 }
 
@@ -539,12 +674,32 @@ fn command_for_scoped(backend: &str, c: &FirewallChange, permanent: bool) -> App
                 return Err(AppError::Validation("firewalld 端口规则必须明确选择 TCP 或 UDP".into()));
             }
             let permanent = if permanent { " --permanent" } else { "" };
+            // Omit --zone to address the same default zone read() displays.
+            // A server's default zone is not necessarily named public.
+            let zone = r.zone.as_deref().map(|zone| format!(" --zone={zone}")).unwrap_or_default();
+            for kind in ["rich:", "direct:"] {
+                if let Some(reference) = r.backend_ref.as_deref().and_then(|value| value.strip_prefix(kind)) {
+                    let current = if kind == "rich:" { parse_firewalld_rich(reference, r.zone.as_deref().unwrap_or("public")) }
+                        else { parse_firewalld_direct(reference) };
+                    let current = current.filter(|current| delete_target_matches(r, current))
+                        .ok_or_else(|| AppError::Validation("firewalld 原始规则与显示字段不一致".into()))?;
+                    if current.read_only.unwrap_or(false) { return Err(AppError::Validation("无法安全操作该 firewalld 规则".into())); }
+                    let verb = if operation == "add" { "add" } else { "remove" };
+                    return if kind == "rich:" {
+                        Ok(format!("sudo -n firewall-cmd{permanent}{zone} --{verb}-rich-rule={}", shell_quote(reference)?))
+                    } else {
+                        // A direct rule is validated as an exact sequence of safe
+                        // protocol/address/port tokens before being reused.
+                        Ok(format!("sudo -n firewall-cmd{permanent} --direct --{verb}-rule {reference}"))
+                    };
+                }
+            }
             if let Some(port_ref) = r.backend_ref.as_deref().and_then(|value| value.strip_prefix("port:")) {
                 if r.direction != "in" || r.source != "any" || r.destination != "any" || r.family != "both" || r.action != "allow" || !matches!(r.protocol.as_str(), "tcp" | "udp") || port_ref != format!("{}/{}", r.ports, r.protocol) {
                     return Err(AppError::Validation("该 firewalld 普通端口规则无法安全转换为当前操作".into()));
                 }
                 let verb = if operation == "add" { "add" } else if operation == "delete" { "remove" } else { return Err(AppError::Validation("firewalld 操作无效".into())); };
-                return Ok(format!("sudo -n firewall-cmd{permanent} --zone={} --{}-port={}", r.zone.as_deref().unwrap_or("public"), verb, port_ref));
+                return Ok(format!("sudo -n firewall-cmd{permanent}{zone} --{verb}-port={port_ref}"));
             }
             let verb = if r.action == "allow" { "accept" } else if r.action == "reject" { "reject" } else { "drop" };
             let mut commands = Vec::new();
@@ -557,7 +712,7 @@ fn command_for_scoped(backend: &str, c: &FirewallChange, permanent: bool) -> App
                         let element = if port != "any" { format!(" port port=\"{}\" protocol=\"{}\"", port.replace(':', "-"), protocol) }
                             else if protocol != "any" { format!(" protocol value=\"{protocol}\"") } else { String::new() };
                         let rich = shell_quote(&format!("rule family=\"{family}\"{source_clause}{destination_clause}{element} {verb}"))?;
-                        commands.push(format!("sudo -n firewall-cmd{permanent} --zone={} --{}rich-rule={}", r.zone.as_deref().unwrap_or("public"), if operation == "add" { "add-" } else { "remove-" }, rich));
+                        commands.push(format!("sudo -n firewall-cmd{permanent}{zone} --{}rich-rule={rich}", if operation == "add" { "add-" } else { "remove-" }));
                     }
                 } else {
                     let action = if operation == "add" { "add" } else { "remove" };
@@ -591,16 +746,14 @@ fn parse_ufw(raw: &str) -> (bool, String, String, Vec<UnifiedFirewallRule>) {
     let verbose = raw.split("__UFW_VERBOSE__").nth(1).unwrap_or(raw).split("__UFW_NUMBERED__").next().unwrap_or("");
     let numbered = raw.split("__UFW_NUMBERED__").nth(1).unwrap_or(raw);
     let enabled = verbose.contains("Status: active") || numbered.contains("Status: active");
-    let mut di = "deny".into();
-    let mut dout = "allow".into();
+    let mut di = "unknown".into();
+    let mut dout = "unknown".into();
     for l in verbose.lines() {
         if l.starts_with("Default:") {
             let low = l.to_lowercase();
-            if low.contains("allow (incoming)") {
-                di = "allow".into()
-            }
-            if low.contains("deny (outgoing)") {
-                dout = "deny".into()
+            for policy in ["allow", "deny", "reject", "disabled"] {
+                if low.contains(&format!("{policy} (incoming)")) { di = policy.into(); }
+                if low.contains(&format!("{policy} (outgoing)")) { dout = policy.into(); }
             }
         }
     }
@@ -619,20 +772,41 @@ fn parse_ufw_numbered_line(line: &str) -> Option<UnifiedFirewallRule> {
     let tokens = body.split_whitespace().collect::<Vec<_>>();
     let action_index = tokens.iter().position(|value| matches!(*value, "ALLOW" | "DENY" | "REJECT"))?;
     if action_index == 0 { return None; }
-    let destination_token = tokens[0];
-    let direction = tokens.get(action_index + 1).copied().filter(|value| matches!(*value, "IN" | "OUT")).unwrap_or("IN");
-    let source = tokens.iter().skip(action_index + 2).filter(|value| **value != "(v6)").copied().collect::<Vec<_>>().join(" ");
+    let explicit_direction = tokens.get(action_index + 1).copied().filter(|value| matches!(*value, "IN" | "OUT" | "FWD"));
+    let direction = explicit_direction.unwrap_or("IN");
+    let destination_tokens = tokens[..action_index].iter().copied().filter(|value| *value != "(v6)").collect::<Vec<_>>();
+    let source_tokens = tokens[action_index + 1 + usize::from(explicit_direction.is_some())..].iter().copied().filter(|value| *value != "(v6)").collect::<Vec<_>>();
+    let destination = parse_ufw_endpoint(&destination_tokens);
+    let source = parse_ufw_endpoint(&source_tokens);
+    let read_only = destination.is_none() || source.as_ref().is_none_or(|(_, ports, _)| ports != "any");
+    let (destination, ports, protocol) = destination.unwrap_or_else(|| ("any".into(), "any".into(), "any".into()));
+    let source = source.map(|(address, _, _)| address).unwrap_or_else(|| "any".into());
     let family = if body.contains("(v6)") { "ipv6" } else { "ipv4" };
-    let protocol = if destination_token.ends_with("/udp") { "udp" } else if destination_token.ends_with("/tcp") { "tcp" } else { "any" };
-    let destination = destination_token.split('/').next().unwrap_or("Anywhere");
     Some(UnifiedFirewallRule {
-        id: format!("ufw-{number}"), backend_ref: Some(number.into()), direction: if direction == "OUT" { "out".into() } else { "in".into() }, family: family.into(), protocol: protocol.into(), ports: if destination.eq_ignore_ascii_case("Anywhere") { "any".into() } else { destination.into() }, source: if source.is_empty() || source.eq_ignore_ascii_case("Anywhere") { "any".into() } else { source }, destination: "any".into(), action: tokens[action_index].to_ascii_lowercase(), enabled: true, comment: comment.into(), zone: None, read_only: None,
+        id: format!("ufw-{number}"), backend_ref: Some(number.into()), direction: match direction { "OUT" => "out", "FWD" => "forward", _ => "in" }.into(), family: family.into(), protocol, ports, source, destination, action: tokens[action_index].to_ascii_lowercase(), enabled: true, comment: if read_only { format!("{comment} [UFW: {body}]").trim().into() } else { comment.into() }, zone: None, read_only: read_only.then_some(true),
     })
+}
+
+fn parse_ufw_endpoint(tokens: &[&str]) -> Option<(String, String, String)> {
+    let mut tokens = tokens.iter().copied();
+    let first = tokens.next()?;
+    let address = if first.eq_ignore_ascii_case("Anywhere") { Some("any".to_owned()) }
+        else if address_family(first).is_ok() { Some(first.to_owned()) } else { None };
+    let (address, port) = if let Some(address) = address { (address, tokens.next()) } else { ("any".to_owned(), Some(first)) };
+    if tokens.next().is_some() { return None; }
+    let Some(port) = port else { return Some((address, "any".into(), "any".into())); };
+    let (port, protocol) = port.split_once('/').unwrap_or((port, "any"));
+    if !["tcp", "udp", "any"].contains(&protocol) || port.is_empty() || !port.chars().all(|c| c.is_ascii_digit() || ",:-".contains(c)) { return None; }
+    Some((address, port.into(), protocol.into()))
 }
 fn parse_firewalld(raw: &str) -> (bool, String, String, Vec<UnifiedFirewallRule>) {
     let mut rules = Vec::new();
-    let zone = raw.lines().next().and_then(|line| line.split_whitespace().next()).filter(|value| !value.contains(':')).unwrap_or("public").to_string();
-    for line in raw.lines() {
+    let (zones, direct) = raw.split_once("__FIREWALLD_DIRECT__").unwrap_or((raw, ""));
+    let mut zone = "public".to_string();
+    for line in zones.lines() {
+        if !line.starts_with(char::is_whitespace) && !line.contains(':') && !line.trim().is_empty() {
+            zone = line.split_whitespace().next().unwrap_or("public").to_owned();
+        }
         let line = line.trim();
         if let Some(ports) = line.strip_prefix("ports:") {
             for p in ports.split_whitespace() {
@@ -653,9 +827,99 @@ fn parse_firewalld(raw: &str) -> (bool, String, String, Vec<UnifiedFirewallRule>
                     read_only: None,
                 });
             }
+        } else if line.starts_with("rule ") {
+            rules.push(parse_firewalld_rich(line, &zone).unwrap_or_else(|| opaque_firewalld_rule(line, Some(&zone), "rich")));
+        } else if let Some(services) = line.strip_prefix("services:") {
+            for service in services.split_whitespace() {
+                let mut rule = opaque_firewalld_rule(service, Some(&zone), "service");
+                rule.action = "allow".into();
+                rules.push(rule);
+            }
         }
     }
+    for line in direct.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        rules.push(parse_firewalld_direct(line).unwrap_or_else(|| opaque_firewalld_rule(line, None, "direct")));
+    }
     (true, "zone policy".into(), "allow".into(), rules)
+}
+
+fn opaque_firewalld_rule(raw: &str, zone: Option<&str>, kind: &str) -> UnifiedFirewallRule {
+    let hash = hex::encode(Sha256::digest(format!("{}:{raw}", zone.unwrap_or("")).as_bytes()));
+    UnifiedFirewallRule {
+        id: format!("fw-{kind}-{hash}"), backend_ref: Some(format!("{kind}:{raw}")),
+        direction: "in".into(), family: "both".into(), protocol: "any".into(), ports: "any".into(),
+        source: "any".into(), destination: "any".into(), action: "unknown".into(), enabled: true,
+        comment: format!("firewalld {kind}: {raw}"), zone: zone.map(str::to_owned), read_only: Some(true),
+    }
+}
+
+fn firewall_input(rule: &UnifiedFirewallRule) -> FirewallRuleInput {
+    FirewallRuleInput { id: Some(rule.id.clone()), backend_ref: rule.backend_ref.clone(), direction: rule.direction.clone(),
+        family: rule.family.clone(), protocol: rule.protocol.clone(), ports: rule.ports.clone(), source: rule.source.clone(),
+        destination: rule.destination.clone(), action: rule.action.clone(), enabled: rule.enabled, comment: rule.comment.clone(),
+        zone: rule.zone.clone(), read_only: rule.read_only }
+}
+
+fn rich_attribute<'a>(token: &'a str, name: &str) -> Option<&'a str> {
+    token.strip_prefix(name)?.strip_prefix('=')?.strip_prefix('"')?.strip_suffix('"')
+}
+
+fn parse_firewalld_rich(raw: &str, zone: &str) -> Option<UnifiedFirewallRule> {
+    let tokens = raw.split_whitespace().collect::<Vec<_>>();
+    if tokens.first().copied() != Some("rule") { return None; }
+    let mut rule = opaque_firewalld_rule(raw, Some(zone), "rich");
+    let mut index = 1;
+    if let Some(family) = tokens.get(index).and_then(|token| rich_attribute(token, "family")) {
+        rule.family = family.to_owned(); index += 1;
+    }
+    if tokens.get(index).copied() == Some("source") {
+        rule.source = rich_attribute(tokens.get(index + 1)?, "address")?.into(); index += 2;
+    }
+    if tokens.get(index).copied() == Some("destination") {
+        rule.destination = rich_attribute(tokens.get(index + 1)?, "address")?.into(); index += 2;
+    }
+    if tokens.get(index).copied() == Some("port") {
+        rule.ports = rich_attribute(tokens.get(index + 1)?, "port")?.into();
+        rule.protocol = rich_attribute(tokens.get(index + 2)?, "protocol")?.into(); index += 3;
+    } else if tokens.get(index).copied() == Some("protocol") {
+        rule.protocol = rich_attribute(tokens.get(index + 1)?, "value")?.into(); index += 2;
+    }
+    if rule.protocol == "ipv6-icmp" { rule.protocol = "icmp".into(); }
+    rule.action = match *tokens.get(index)? { "accept" => "allow", "drop" => "deny", "reject" => "reject", _ => return None }.into();
+    if index + 1 != tokens.len() { return None; }
+    validate_rule(&firewall_input(&rule)).ok()?;
+    rule_families(&firewall_input(&rule)).ok()?;
+    rule.read_only = None;
+    Some(rule)
+}
+
+fn parse_firewalld_direct(raw: &str) -> Option<UnifiedFirewallRule> {
+    let tokens = raw.split_whitespace().collect::<Vec<_>>();
+    if tokens.len() < 6 || tokens[1] != "filter" || tokens[3] != "0" { return None; }
+    let mut rule = opaque_firewalld_rule(raw, None, "direct");
+    rule.family = tokens[0].into();
+    rule.direction = match tokens[2] { "INPUT" => "in", "OUTPUT" => "out", "FORWARD" => "forward", _ => return None }.into();
+    let mut index = 4;
+    let mut seen = std::collections::HashSet::new();
+    while index + 1 < tokens.len() {
+        let flag = tokens[index]; let value = tokens[index + 1];
+        if !seen.insert(flag) { return None; }
+        match flag {
+            "-p" => rule.protocol = if value == "ipv6-icmp" { "icmp" } else { value }.into(),
+            "-s" => rule.source = value.into(),
+            "-d" => rule.destination = value.into(),
+            "-m" if value == "multiport" => {},
+            "--dports" => rule.ports = value.into(),
+            "-j" if index + 2 == tokens.len() => rule.action = match value { "ACCEPT" => "allow", "DROP" => "deny", "REJECT" => "reject", _ => return None }.into(),
+            _ => return None,
+        }
+        index += 2;
+    }
+    if index != tokens.len() { return None; }
+    validate_rule(&firewall_input(&rule)).ok()?;
+    rule_families(&firewall_input(&rule)).ok()?;
+    rule.read_only = None;
+    Some(rule)
 }
 fn parse_nft(raw: &str) -> Vec<UnifiedFirewallRule> {
     raw.lines()
@@ -774,6 +1038,51 @@ mod tests {
         assert_eq!(command, "sudo -n firewall-cmd --zone=corp --remove-port=8443/tcp");
     }
     #[test]
+    fn firewalld_new_rules_use_the_servers_default_zone() {
+        let command = command_for("firewalld", &FirewallChange { operation: "add".into(), rule: rule() }).unwrap();
+        assert!(!command.contains("--zone="), "{command}");
+    }
+
+    #[test]
+    fn firewalld_reads_created_rich_and_direct_rules_and_preserves_other_rules() {
+        let raw = "corp (active)\n  services: ssh\n  ports: 8443/tcp\n  rich rules:\n    rule family=\"ipv4\" source address=\"192.0.2.1/32\" port port=\"60123\" protocol=\"tcp\" accept\n    rule family=\"ipv6\" protocol value=\"ipv6-icmp\" drop\n    rule family=\"ipv4\" source ipset=\"trusted\" accept\nother\n  ports: 5353/udp\n__FIREWALLD_DIRECT__\nipv4 filter OUTPUT 0 -p tcp -m multiport --dports 60124 -j ACCEPT\n";
+        let (_, _, _, rules) = parse_firewalld(raw);
+        assert_eq!(rules.len(), 7);
+        assert!(rules[0].read_only.unwrap());
+        assert_eq!(rules[2].ports, "60123");
+        assert_eq!(rules[2].zone.as_deref(), Some("corp"));
+        assert!(!rules[2].read_only.unwrap_or(false));
+        assert_eq!(rules[3].protocol, "icmp");
+        assert!(rules[4].read_only.unwrap());
+        assert_eq!(rules[5].zone.as_deref(), Some("other"));
+        assert_eq!(rules[6].direction, "out");
+        for rule in [&rules[2], &rules[3], &rules[6]] {
+            let input = firewall_input(rule);
+            let delete = command_for("firewalld", &FirewallChange { operation: "delete".into(), rule: input.clone() }).unwrap();
+            let original = rule.backend_ref.as_deref().unwrap().split_once(':').unwrap().1;
+            assert!(delete.contains(original));
+            let mut tampered = input; tampered.ports = "22".into();
+            assert!(command_for("firewalld", &FirewallChange { operation: "delete".into(), rule: tampered }).is_err());
+        }
+        assert!(parse_firewalld_direct("ipv4 filter OUTPUT 0 -p tcp -j ACCEPT;reboot").is_none());
+        assert!(parse_firewalld_direct("ipv4 filter OUTPUT 0 -p tcp -p udp -j ACCEPT").is_none());
+    }
+
+    #[test]
+    fn firewalld_queries_and_restores_preserve_permanent_scope() {
+        for (command, query, restored) in [
+            ("sudo -n firewall-cmd --permanent --zone=corp --remove-port=22/tcp", "--query-port=22/tcp", "--add-port=22/tcp"),
+            ("sudo -n firewall-cmd --permanent --add-rich-rule='rule family=\"ipv4\" accept'", "--query-rich-rule=", "--add-rich-rule="),
+            ("sudo -n firewall-cmd --permanent --direct --remove-rule ipv4 filter OUTPUT 0 -j DROP", "--query-rule ipv4", "--add-rule ipv4"),
+        ] {
+            let presence = firewalld_rule_operation(command, "query").unwrap();
+            assert!(presence.contains(query));
+            assert!(presence.contains("--permanent"));
+            assert!(firewalld_rule_operation(command, "add").unwrap().contains(restored));
+            assert!(firewalld_rule_operation(command, "remove").unwrap().contains("--remove-"));
+        }
+    }
+    #[test]
     fn parses_numbered_ufw_rules_without_treating_comments_as_sources() {
         let raw = "__UFW_VERBOSE__\nStatus: active\nDefault: deny (incoming), allow (outgoing)\n__UFW_NUMBERED__\nStatus: active\n[ 1] 22/tcp ALLOW IN 10.0.0.0/8 # SSH office\n[ 2] 443/tcp (v6) ALLOW IN Anywhere (v6) # Web v6";
         let (_, _, _, rules) = parse_ufw(raw);
@@ -847,12 +1156,111 @@ mod tests {
     }
 
     #[test]
+    fn ufw_preserves_reject_policies_and_does_not_invent_inactive_defaults() {
+        let (_, incoming, outgoing, _) = parse_ufw("Status: active\nDefault: reject (incoming), deny (outgoing), disabled (routed)\n");
+        assert_eq!(incoming, "reject"); assert_eq!(outgoing, "deny");
+        let (enabled, incoming, outgoing, _) = parse_ufw("Status: inactive\n");
+        assert!(!enabled); assert_eq!(incoming, "unknown"); assert_eq!(outgoing, "unknown");
+    }
+
+    #[test]
+    fn ufw_preserves_destination_and_forward_direction_and_marks_opaque_rules_read_only() {
+        let rule = parse_ufw_numbered_line("[ 4] 10.0.0.8 443/tcp ALLOW FWD 192.0.2.1 # routed").unwrap();
+        assert_eq!(rule.direction, "forward"); assert_eq!(rule.destination, "10.0.0.8");
+        assert_eq!(rule.ports, "443"); assert_eq!(rule.protocol, "tcp"); assert_eq!(rule.source, "192.0.2.1");
+        assert!(!rule.read_only.unwrap_or(false));
+        let ipv6 = parse_ufw_numbered_line("[ 5] 2001:db8::8 443/tcp (v6) ALLOW OUT Anywhere (v6)").unwrap();
+        assert_eq!(ipv6.destination, "2001:db8::8"); assert_eq!(ipv6.family, "ipv6");
+        assert_eq!(ipv6.source, "any"); assert_eq!(ipv6.direction, "out");
+        let opaque = parse_ufw_numbered_line("[ 6] OpenSSH ALLOW IN Anywhere").unwrap();
+        assert!(opaque.read_only.unwrap()); assert!(opaque.comment.contains("OpenSSH"));
+        let interface = parse_ufw_numbered_line("[ 7] 443/tcp on eth0 ALLOW IN Anywhere").unwrap();
+        assert!(interface.read_only.unwrap());
+        let source_port = parse_ufw_numbered_line("[ 8] 443/tcp ALLOW IN 192.0.2.1 12345/tcp").unwrap();
+        assert!(source_port.read_only.unwrap());
+    }
+
+    #[test]
+    fn firewall_read_propagates_failures_and_prefers_the_running_backend() {
+        use std::{path::PathBuf, process::Command};
+        let bash = [PathBuf::from(r"C:\msys64\usr\bin\bash.exe"), PathBuf::from(r"C:\Program Files\Git\bin\bash.exe"), PathBuf::from("/bin/bash")]
+            .into_iter().find(|path| path.exists());
+        let Some(bash) = bash else { eprintln!("Skipped shell integration: Bash unavailable"); return; };
+        let run = |fixture: &str| Command::new(&bash).args(["-c", &format!("export PATH=/usr/bin:/bin:$PATH; id() {{ echo 0; }}; {fixture}\n{READ_COMMAND}")]).output().unwrap();
+        let denied = run("ufw() { echo permission-denied >&2; return 1; }");
+        assert!(!denied.status.success());
+        assert!(String::from_utf8_lossy(&denied.stderr).contains("permission-denied"));
+        assert!(!String::from_utf8_lossy(&denied.stdout).contains("__ROLLBACK__"));
+        let denied_verbose = run("ufw() { if [ \"$*\" = status ]; then echo 'Status: active'; else echo verbose-denied >&2; return 1; fi; }");
+        assert!(!denied_verbose.status.success());
+        assert!(!String::from_utf8_lossy(&denied_verbose.stdout).contains("__ROLLBACK__"));
+        let active = run("ufw() { echo 'Status: inactive'; }; firewall-cmd() { case \"$1\" in --state) echo running;; --get-default-zone) echo corp;; --list-all-zones) printf 'corp (active)\\n  ports: 8443/tcp\\n';; --direct) :;; *) return 1;; esac; }");
+        assert!(active.status.success(), "{}", String::from_utf8_lossy(&active.stderr));
+        let stdout = String::from_utf8_lossy(&active.stdout);
+        assert!(stdout.starts_with("firewalld\n"), "{stdout}");
+        assert!(stdout.contains("__FIREWALLD_DEFAULT__:corp"));
+        let denied_firewalld = run("ufw() { echo 'Status: inactive'; }; firewall-cmd() { case \"$1\" in --state) echo running;; --get-default-zone) echo corp;; *) echo firewalld-denied >&2; return 1;; esac; }");
+        assert!(!denied_firewalld.status.success());
+        assert!(!String::from_utf8_lossy(&denied_firewalld.stdout).contains("__ROLLBACK__"));
+    }
+
+    #[test]
+    fn sudo_authentication_errors_are_retryable_without_hiding_other_permission_failures() {
+        let output = |stderr: &str| ExecOutput { stdout: String::new(), stderr: stderr.into(), exit_code: 1, duration_ms: 0 };
+        assert!(matches!(firewall_read_error(&output("sudo: a password is required"), false), AppError::SudoRequired));
+        assert!(matches!(firewall_read_error(&output("Sorry, try again.\nsudo: 1 incorrect password attempt"), true), AppError::SudoAuthenticationFailed(_)));
+        assert!(matches!(firewall_read_error(&output("sudo: no password was provided"), true), AppError::SudoAuthenticationFailed(_)));
+        for stderr in ["sudo: ufw: command not found", "user is not in the sudoers file", "ERROR: permission denied", "cannot read /etc/ufw: a password is required"] {
+            assert!(matches!(firewall_read_error(&output(stderr), true), AppError::Permission(_)), "{stderr}");
+        }
+    }
+
+    #[test]
+    fn password_protected_firewall_read_consumes_one_secret_line_for_the_whole_script() {
+        use std::{io::Write, path::PathBuf, process::{Command, Stdio}};
+        let bash = [PathBuf::from(r"C:\msys64\usr\bin\bash.exe"), PathBuf::from(r"C:\Program Files\Git\bin\bash.exe"), PathBuf::from("/bin/bash")]
+            .into_iter().find(|path| path.exists());
+        let Some(bash) = bash else { eprintln!("Skipped shell integration: Bash unavailable"); return; };
+        let fixture = r#"export PATH=/usr/bin:/bin:$PATH
+id() { if [ "$SSHOPS_FAKE_ROOT" = 1 ]; then echo 0; else echo 1000; fi; }
+ufw() { if [ "$SSHOPS_FAKE_ROOT" != 1 ]; then echo denied >&2; return 1; fi; echo 'Status: active'; }
+sudo() {
+    [ "$1" = -S ] && [ "$2" = -p ] || return 7
+    IFS= read -r supplied || return 8
+    if [ "$supplied" != test-only-pass ]; then echo 'sudo: 1 incorrect password attempt' >&2; return 1; fi
+    echo authenticated-once >&2
+    shift 3
+    export SSHOPS_FAKE_ROOT=1
+    "$@"
+}
+export -f id ufw sudo
+"#;
+        let script = format!("{fixture}\n{}", firewall_read_command(true).unwrap());
+        let run = |input: &[u8]| {
+            let mut child = Command::new(&bash).args(["-c", &script]).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+            child.stdin.take().unwrap().write_all(input).unwrap();
+            child.wait_with_output().unwrap()
+        };
+        let result = run(b"test-only-pass\n");
+        assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
+        assert!(String::from_utf8_lossy(&result.stdout).starts_with("ufw\n"));
+        assert_eq!(String::from_utf8_lossy(&result.stderr).matches("authenticated-once").count(), 1);
+        assert!(!String::from_utf8_lossy(&result.stdout).contains("test-only-pass"));
+        let denied = run(b"wrong-password\n");
+        assert!(!denied.status.success());
+        assert!(String::from_utf8_lossy(&denied.stderr).contains("incorrect password attempt"));
+        assert!(denied.stdout.is_empty());
+    }
+
+    #[test]
     fn at_job_keeps_its_script_separate_from_sudo_stdin() {
         let command = at_schedule_command("sshops-test", "ufw reload").unwrap();
         assert!(command.starts_with("sudo -n sh -c "));
         assert!(command.contains("/run/sshops-test/committed"));
         assert!(!command.contains("| sudo"));
         assert!(!command.contains("/tmp/"));
+        assert!(command.contains("/run/sshops-test/deadline"));
+        assert!(!command.contains("sleep 60"));
     }
 
     #[test]
@@ -866,6 +1274,8 @@ mod tests {
         }
         let root = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("mutation-started"), "").unwrap();
+        std::fs::write(root.path().join("apply-completed"), "").unwrap();
+        std::fs::write(root.path().join("permanent-restore"), "true").unwrap();
         std::fs::write(root.path().join("deadline"), (chrono::Utc::now().timestamp() + 60).to_string()).unwrap();
         let commit = format!("export PATH=/usr/bin:/bin:$PATH; {}", locked_commit_command("review-test", "sleep 0.1; echo commit >> effects").unwrap().replace("/run/review-test", "."));
         let rollback = format!("export PATH=/usr/bin:/bin:$PATH; {}", locked_rollback_command("review-test", "echo rollback >> effects").unwrap().replace("/run/review-test", "."));
@@ -890,5 +1300,51 @@ mod tests {
         let apply = format!("export PATH=/usr/bin:/bin:$PATH; {}", locked_apply_command("review-test", "echo apply >> effects").unwrap().replace("/run/review-test", "."));
         assert!(!Command::new(&bash).args(["-c", &apply]).current_dir(untouched.path()).stderr(Stdio::null()).status().unwrap().success());
         assert!(!untouched.path().join("effects").exists());
+    }
+
+    #[test]
+    fn failed_commit_restores_permanent_and_runtime_state_in_a_real_shell() {
+        use std::{path::PathBuf, process::{Command, Stdio}};
+        let bash = [PathBuf::from(r"C:\msys64\usr\bin\bash.exe"), PathBuf::from(r"C:\Program Files\Git\bin\bash.exe"), PathBuf::from("/bin/bash")]
+            .into_iter().find(|path| path.exists());
+        let Some(bash) = bash else { eprintln!("Skipped shell integration: Bash unavailable"); return; };
+        if !Command::new(&bash).args(["-c", "PATH=/usr/bin:/bin:$PATH; command -v flock"]).stdout(Stdio::null()).status().unwrap().success() {
+            eprintln!("Skipped shell integration: flock unavailable"); return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let run = |script: String| Command::new(&bash)
+            .args(["-c", &format!("export PATH=/usr/bin:/bin:$PATH; {}", script.replace("/run/review-test", "."))])
+            .current_dir(root.path()).stderr(Stdio::null()).status().unwrap().success();
+        std::fs::write(root.path().join("deadline"), (chrono::Utc::now().timestamp() + 60).to_string()).unwrap();
+
+        // A failed/partial apply must never become eligible for commit.
+        assert!(!run(locked_apply_command("review-test", "echo partial > runtime; false").unwrap()));
+        assert!(!root.path().join("apply-completed").exists());
+        assert!(!run(locked_commit_command("review-test", "echo bad > permanent").unwrap()));
+        assert!(!root.path().join("permanent").exists());
+        assert!(!run(locked_apply_command("review-test", "echo duplicate > runtime").unwrap()));
+
+        // Simulate a successful apply and a two-rule commit that only writes
+        // its first permanent rule. Rollback restores the original permanent
+        // presence, including rules that already existed before this plan.
+        std::fs::write(root.path().join("apply-completed"), "").unwrap();
+        std::fs::write(root.path().join("permanent"), "original\n").unwrap();
+        std::fs::write(root.path().join("permanent-restore"), "echo original > permanent").unwrap();
+        assert!(!run(locked_commit_command("review-test", "echo partial > permanent && false").unwrap()));
+        assert!(!root.path().join("committed").exists());
+        assert!(run(locked_rollback_command("review-test", "echo original > runtime").unwrap()));
+        assert_eq!(std::fs::read_to_string(root.path().join("permanent")).unwrap().trim(), "original");
+        assert_eq!(std::fs::read_to_string(root.path().join("runtime")).unwrap().trim(), "original");
+        assert!(root.path().join("rolled-back").exists());
+        assert!(!run(locked_commit_command("review-test", "echo bad > permanent").unwrap()));
+
+        // Failure to restore permanent config must not skip live restoration
+        // (which may be needed to recover SSH), or claim full rollback success.
+        std::fs::remove_file(root.path().join("rolled-back")).unwrap();
+        std::fs::write(root.path().join("permanent-restore"), "false").unwrap();
+        std::fs::write(root.path().join("runtime"), "changed").unwrap();
+        assert!(!run(locked_rollback_command("review-test", "echo original > runtime").unwrap()));
+        assert_eq!(std::fs::read_to_string(root.path().join("runtime")).unwrap().trim(), "original");
+        assert!(!root.path().join("rolled-back").exists());
     }
 }

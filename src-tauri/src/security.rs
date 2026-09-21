@@ -18,29 +18,14 @@ pub fn redact(input: &str) -> String {
             while result.as_bytes().get(value_start).is_some_and(|b| b.is_ascii_whitespace()) {
                 value_start += 1;
             }
-            let end = if result.as_bytes().get(value_start) == Some(&b'\'') || result.as_bytes().get(value_start) == Some(&b'"') {
-                let quote = result.as_bytes()[value_start];
-                let mut index = value_start + 1;
-                while index < result.len() {
-                    if result.as_bytes()[index] == quote && result.as_bytes().get(index.saturating_sub(1)) != Some(&b'\\') {
-                        index += 1;
-                        break;
-                    }
-                    index += 1;
-                }
-                index
-            } else if marker.eq_ignore_ascii_case("Authorization:") {
+            let end = if marker.eq_ignore_ascii_case("Authorization:") {
                 result[value_start..]
                     .char_indices()
                     .find(|(_, c)| *c == '\r' || *c == '\n' || *c == '&' || *c == ';')
                     .map(|(offset, _)| value_start + offset)
                     .unwrap_or(result.len())
             } else {
-                result[value_start..]
-                    .char_indices()
-                    .find(|(_, c)| c.is_whitespace() || *c == '&' || *c == ';')
-                    .map(|(offset, _)| value_start + offset)
-                    .unwrap_or(result.len())
+                shell_value_end(&result, value_start)
             };
             if value_start >= end {
                 cursor = marker_start + marker.len();
@@ -51,6 +36,32 @@ pub fn redact(input: &str) -> String {
         }
     }
     result
+}
+
+fn shell_value_end(input: &str, start: usize) -> usize {
+    // Shell values can concatenate quoted and unquoted segments, including
+    // the standard 'first'\''second' spelling produced by shell_quote().
+    // Stopping at the first closing quote leaks the rest of that secret.
+    let bytes = input.as_bytes();
+    let mut quote = None;
+    let mut index = start;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        match quote {
+            Some(b'\'') => { if byte == b'\'' { quote = None; } }
+            Some(b'"') => {
+                if byte == b'"' { quote = None; }
+                else if byte == b'\\' { index = (index + 1).min(bytes.len()); }
+            }
+            _ => {
+                if byte.is_ascii_whitespace() || matches!(byte, b'&' | b';' | b'|') { break; }
+                if matches!(byte, b'\'' | b'"') { quote = Some(byte); }
+                else if byte == b'\\' { index = (index + 1).min(bytes.len()); }
+            }
+        }
+        index += 1;
+    }
+    index.min(bytes.len())
 }
 
 fn find_ascii_case_insensitive(haystack: &str, needle: &str, from: usize) -> Option<usize> {
@@ -81,5 +92,15 @@ mod tests {
         assert_eq!(redact("Authorization: Bearer TEST_TOKEN"), "Authorization: [REDACTED]");
         assert_eq!(redact("password='TEST VALUE'"), "password=[REDACTED]");
         assert!(!redact("İİİtoken=x").contains("=x"));
+    }
+
+    #[test]
+    fn redacts_entire_shell_values_including_escaped_and_concatenated_segments() {
+        assert_eq!(redact(r#"password='first'\''second' next=public"#), "password=[REDACTED] next=public");
+        assert_eq!(redact(r#"token="first"second; echo done"#), "token=[REDACTED]; echo done");
+        assert_eq!(redact(r#"secret=first\ second | cat"#), "secret=[REDACTED] | cat");
+        assert_eq!(redact("token='中文'后缀&echo ok"), "token=[REDACTED]&echo ok");
+        assert_eq!(redact(r#"password="ends\\" next=public"#), "password=[REDACTED] next=public");
+        assert_eq!(redact("token=value\\"), "token=[REDACTED]");
     }
 }

@@ -33,6 +33,7 @@ export default function TerminalView({ host, active = true }: { host: HostProfil
 
   React.useEffect(() => {
     if (!containerRef.current) return;
+    const container = containerRef.current;
     let disposed = false;
     let sessionId: string | undefined;
     let queuedBytes = 0;
@@ -48,12 +49,13 @@ export default function TerminalView({ host, active = true }: { host: HostProfil
     const decoder = new TextDecoder();
 
     const send = (bytes: number[]) => {
+      if (disposed) return;
       if (!sessionId) {
         if (queuedBytes + bytes.length > 64 * 1024) { setError("SSH 会话仍在建立，暂存输入已达到 64 KB 上限"); return; }
         pending.push(bytes); queuedBytes += bytes.length; return;
       }
       const currentSession = sessionId;
-      sendChain = sendChain.then(() => api.terminalInput(currentSession, bytes)).catch((reason) => { if (!disposed) setError(formatError(reason)); });
+      sendChain = sendChain.then(() => { if (!disposed) return api.terminalInput(currentSession, bytes); }).catch((reason) => { if (!disposed) setError(formatError(reason)); });
     };
     const inputSubscription = terminal.onData((data) => send(Array.from(encoder.encode(data))));
     const onPaste = (event: ClipboardEvent) => {
@@ -66,7 +68,7 @@ export default function TerminalView({ host, active = true }: { host: HostProfil
     };
     // xterm installs its own paste listener on the terminal element. Capture
     // before it so the safety dialog cannot be bypassed by Ctrl/Cmd+V.
-    containerRef.current.addEventListener("paste", onPaste, true);
+    container.addEventListener("paste", onPaste, true);
 
     void api.terminalOpen(host.id, terminal.cols, terminal.rows, settings?.terminalCommandLogging !== false, (event) => {
       if (!disposed) terminal.write(decoder.decode(new Uint8Array(event.payload), { stream: true }));
@@ -94,9 +96,11 @@ export default function TerminalView({ host, active = true }: { host: HostProfil
     const onKey = (event: KeyboardEvent) => { if (activeRef.current && event.ctrlKey && event.shiftKey && event.key.toLowerCase() === "c" && terminal.hasSelection()) { void navigator.clipboard.writeText(terminal.getSelection()).catch((reason) => !disposed && setError(formatError(reason))); event.preventDefault(); } };
     window.addEventListener("keydown", onKey);
     return () => {
-      disposed = true; inputSubscription.dispose(); resizeSubscription.dispose(); observer.disconnect(); window.removeEventListener("keydown", onKey); containerRef.current?.removeEventListener("paste", onPaste, true);
+      disposed = true; inputSubscription.dispose(); resizeSubscription.dispose(); observer.disconnect(); window.removeEventListener("keydown", onKey); container.removeEventListener("paste", onPaste, true);
       const closingSession = sessionId;
-      if (closingSession) void sendChain.then(() => api.terminalClose(closingSession)).catch(() => undefined);
+      // Closing cancels a blocked backend write. Waiting for the input queue
+      // first would keep a dead session alive indefinitely after disconnect.
+      if (closingSession) void api.terminalClose(closingSession).catch(() => undefined);
       sessionIdRef.current = undefined;
       terminal.dispose(); termRef.current = null; fitAddonRef.current = null; searchAddonRef.current = null;
     };

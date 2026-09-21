@@ -82,11 +82,11 @@ struct ManagedConnection {
 enum TerminalCommand {
     Input(Vec<u8>),
     Resize(u32, u32),
-    Close,
 }
 struct ManagedTerminal {
     host_id: String,
     sender: mpsc::Sender<TerminalCommand>,
+    cancel: watch::Sender<bool>,
     audit_enabled: Arc<AtomicBool>,
     audit_configured: bool,
 }
@@ -276,11 +276,16 @@ impl SshManager {
         validate_jump_chain(db, &profile, &mut HashSet::new())?;
         let lock = self.connection_lock(&profile.id);
         let _guard = lock.lock().await;
+        // A recursive jump connection may have waited behind an edit or delete.
+        // Reload under the same lock used by those operations before using the
+        // endpoint, credentials or route captured by its caller.
+        let profile = db.host_get(&profile.id)?;
+        validate_jump_chain(db, &profile, &mut HashSet::new())?;
         timeout(Duration::from_secs(60), self.connect_inner(db, profile, supplied_password))
             .await.map_err(|_| AppError::Ssh("SSH 连接或认证超时".into()))?
     }
 
-    fn connection_lock(&self, host_id: &str) -> Arc<Mutex<()>> {
+    pub(crate) fn connection_lock(&self, host_id: &str) -> Arc<Mutex<()>> {
         self.connection_locks.write().entry(host_id.into())
             .or_insert_with(|| Arc::new(Mutex::new(()))).clone()
     }
@@ -352,12 +357,17 @@ impl SshManager {
                     .private_key_path
                     .as_ref()
                     .ok_or_else(|| AppError::Validation("未配置私钥路径".into()))?;
-                let passphrase = profile
+                let passphrase = supplied_password.or_else(|| profile
                     .credential_id
                     .as_deref()
-                    .and_then(|id| security::read_secret(id).ok());
+                    .and_then(|id| security::read_secret(id).ok()));
                 let key = keys::load_secret_key(Path::new(path), passphrase.as_deref())
-                    .map_err(|e| AppError::Ssh(format!("无法读取私钥：{e}")))?;
+                    .map_err(|error| match error {
+                        keys::Error::KeyIsEncrypted if passphrase.is_none() => AppError::KeyPassphraseRequired,
+                        keys::Error::SshKey(ssh_key::Error::Crypto) | keys::Error::KeyIsCorrupt
+                            if passphrase.is_some() => AppError::Permission("私钥口令错误或私钥文件已损坏，请检查后重试".into()),
+                        error => AppError::Ssh(format!("无法读取私钥：{error}")),
+                    })?;
                 let hash = handle
                     .best_supported_rsa_hash()
                     .await
@@ -446,7 +456,8 @@ impl SshManager {
         self.disconnect_inner(host_id).await
     }
 
-    async fn disconnect_inner(&self, host_id: &str) -> AppResult<()> {
+    // The caller must hold this host's connection_lock for the entire call.
+    pub(crate) async fn disconnect_inner(&self, host_id: &str) -> AppResult<()> {
         let forward_ids = self.forwards.read().iter().filter(|(_, forward)| forward.host_id == host_id).map(|(id, _)| id.clone()).collect::<Vec<_>>();
         // A failed remote cancellation must not prevent disconnecting the transport.
         for id in &forward_ids { let _ = self.forward_stop(id).await; }
@@ -569,6 +580,7 @@ impl SshManager {
             .await
             .map_err(|e| AppError::Ssh(e.to_string()))?
             .map(|entry| {
+                validate_remote_entry_name(&entry.file_name())?;
                 let metadata = entry.metadata();
                 let kind = if metadata.is_dir() {
                     "directory"
@@ -577,18 +589,20 @@ impl SshManager {
                 } else {
                     "file"
                 };
-                SftpEntry {
+                Ok(SftpEntry {
                     name: entry.file_name(),
                     path: entry.path(),
                     kind: kind.into(),
                     size: metadata.len(),
-                    modified_at: None,
+                    modified_at: metadata.mtime
+                        .and_then(|timestamp| chrono::DateTime::<chrono::Utc>::from_timestamp(timestamp as i64, 0))
+                        .map(|timestamp| timestamp.to_rfc3339()),
                     permissions: Some(metadata.permissions().to_string()),
-                }
+                })
             })
-            .collect();
+            .collect::<AppResult<Vec<_>>>();
         let _ = sftp.close().await;
-        Ok(entries)
+        entries
     }
 
     pub async fn sftp_upload(
@@ -795,6 +809,7 @@ impl SshManager {
         drop(handle);
         let session_id = Uuid::new_v4().to_string();
         let (sender, mut receiver) = mpsc::channel::<TerminalCommand>(256);
+        let (cancel, mut cancelled) = watch::channel(false);
         let audit_enabled = Arc::new(AtomicBool::new(command_logging));
         let id = session_id.clone();
         let hid = host_id.to_string();
@@ -811,7 +826,7 @@ impl SshManager {
             writer.flush().await.map_err(AppError::Io)?;
         }
         self.terminals.write().insert(session_id.clone(), ManagedTerminal {
-            host_id: host_id.to_string(), sender, audit_enabled,
+            host_id: host_id.to_string(), sender, cancel, audit_enabled,
             audit_configured: command_logging,
         });
         tokio::spawn(async move {
@@ -819,32 +834,37 @@ impl SshManager {
             let audit_timeout = tokio::time::sleep(Duration::from_secs(8));
             tokio::pin!(audit_timeout);
             let mut audit_timeout_pending = command_logging;
-            loop {
-                tokio::select! {
-                    command=receiver.recv()=>match command {
-                        Some(TerminalCommand::Input(data))=>{ if writer.write_all(&data).await.is_err(){break;} let _=writer.flush().await; },
-                        Some(TerminalCommand::Resize(cols, rows))=>{ let _=channel.window_change(cols, rows, 0, 0).await; },
-                        Some(TerminalCommand::Close)|None=>break
-                    },
-                    message=channel.wait()=>match message {
-                        Some(ChannelMsg::Data{data})|Some(ChannelMsg::ExtendedData{data,..})=>{
-                            let (visible, audits) = if command_logging { audit_parser.push(&data) } else { (data.to_vec(), Vec::new()) };
-                            if !visible.is_empty() { let _=ipc.send(StreamEnvelope{seq:sequence.fetch_add(1,Ordering::Relaxed),timestamp:chrono::Utc::now().to_rfc3339(),host_id:hid.clone(),session_id:Some(id.clone()),payload:visible}); }
-                            if audit_parser.settled() { audit_timeout_pending = false; }
-                            if audit_enabled_for_task.load(Ordering::Relaxed) {
-                                for (audit_sequence, kind) in audits { let _ = audit_sender.send(TerminalAuditEvent { session_id: id.clone(), host_id: hid.clone(), sequence: audit_sequence, kind, timestamp: chrono::Utc::now().to_rfc3339() }); }
-                            }
+            // Cancellation must interrupt a blocked SSH write as well as the
+            // command queue; a full queue must never prevent closing a terminal.
+            let work = async {
+                loop {
+                    tokio::select! {
+                        command=receiver.recv()=>match command {
+                            Some(TerminalCommand::Input(data))=>{ if writer.write_all(&data).await.is_err(){break;} let _=writer.flush().await; },
+                            Some(TerminalCommand::Resize(cols, rows))=>{ let _=channel.window_change(cols, rows, 0, 0).await; },
+                            None=>break
                         },
-                        Some(ChannelMsg::ExitStatus{..})|None=>break,
-                        _=>{}
-                    },
-                    _=&mut audit_timeout, if audit_timeout_pending=>{
-                        audit_timeout_pending=false;
-                        let notice=b"\r\n\x1b[33m[SSH Ops] Command audit did not initialize; terminal input is not being recorded.\x1b[0m\r\n".to_vec();
-                        let _=ipc.send(StreamEnvelope{seq:sequence.fetch_add(1,Ordering::Relaxed),timestamp:chrono::Utc::now().to_rfc3339(),host_id:hid.clone(),session_id:Some(id.clone()),payload:notice});
-                    },
+                        message=channel.wait()=>match message {
+                            Some(ChannelMsg::Data{data})|Some(ChannelMsg::ExtendedData{data,..})=>{
+                                let (visible, audits) = if command_logging { audit_parser.push(&data) } else { (data.to_vec(), Vec::new()) };
+                                if !visible.is_empty() { let _=ipc.send(StreamEnvelope{seq:sequence.fetch_add(1,Ordering::Relaxed),timestamp:chrono::Utc::now().to_rfc3339(),host_id:hid.clone(),session_id:Some(id.clone()),payload:visible}); }
+                                if audit_parser.settled() { audit_timeout_pending = false; }
+                                if audit_enabled_for_task.load(Ordering::Relaxed) {
+                                    for (audit_sequence, kind) in audits { let _ = audit_sender.send(TerminalAuditEvent { session_id: id.clone(), host_id: hid.clone(), sequence: audit_sequence, kind, timestamp: chrono::Utc::now().to_rfc3339() }); }
+                                }
+                            },
+                            Some(ChannelMsg::Close)|None=>break,
+                            _=>{}
+                        },
+                        _=&mut audit_timeout, if audit_timeout_pending=>{
+                            audit_timeout_pending=false;
+                            let notice=b"\r\n\x1b[33m[SSH Ops] Command audit did not initialize; terminal input is not being recorded.\x1b[0m\r\n".to_vec();
+                            let _=ipc.send(StreamEnvelope{seq:sequence.fetch_add(1,Ordering::Relaxed),timestamp:chrono::Utc::now().to_rfc3339(),host_id:hid.clone(),session_id:Some(id.clone()),payload:notice});
+                        },
+                    }
                 }
-            }
+            };
+            tokio::select! { _ = cancelled.changed() => {}, _ = work => {} }
             if command_logging { let remaining = audit_parser.finish(); if !remaining.is_empty() { let _=ipc.send(StreamEnvelope{seq:sequence.fetch_add(1,Ordering::Relaxed),timestamp:chrono::Utc::now().to_rfc3339(),host_id:hid.clone(),session_id:Some(id.clone()),payload:remaining}); } }
             let _ = timeout(Duration::from_secs(2), channel.close()).await;
             let _ = manager.terminals.write().remove(&id);
@@ -880,7 +900,7 @@ impl SshManager {
     pub async fn terminal_close(&self, session_id: &str) -> AppResult<()> {
         let terminal = { self.terminals.write().remove(session_id) };
         if let Some(terminal) = terminal {
-            let _ = terminal.sender.send(TerminalCommand::Close).await;
+            let _ = terminal.cancel.send(true);
         }
         Ok(())
     }
@@ -1036,6 +1056,16 @@ fn validate_remote_path(path: &str) -> AppResult<()> {
     Ok(())
 }
 
+fn validate_remote_entry_name(name: &str) -> AppResult<()> {
+    // READDIR names are untrusted single path components, never paths. In
+    // particular, joining "../sibling" must not expand a recursive operation.
+    validate_remote_path(name)?;
+    if name == "." || name.contains('/') {
+        return Err(AppError::Validation("远程目录返回了无效的文件名".into()));
+    }
+    Ok(())
+}
+
 fn validate_delete_target(path: &str) -> AppResult<()> {
     validate_remote_path(path)?;
     if path.split('/').all(|part| part.is_empty() || part == ".") {
@@ -1063,7 +1093,8 @@ async fn remove_remote_tree(sftp: &SftpSession, path: &str) -> AppResult<()> {
         return Ok(());
     }
     if metadata.is_dir() {
-        let entries = sftp.read_dir(path).await.map_err(|e| AppError::Ssh(e.to_string()))?;
+        let entries = sftp.read_dir(path).await.map_err(|e| AppError::Ssh(e.to_string()))?.collect::<Vec<_>>();
+        for entry in &entries { validate_remote_entry_name(&entry.file_name())?; }
         for entry in entries { let child = entry.path(); let child_meta = entry.metadata(); if child_meta.is_dir() && !child_meta.is_symlink() { Box::pin(remove_remote_tree(sftp, &child)).await?; } else { sftp.remove_file(&child).await.map_err(|e| AppError::Ssh(e.to_string()))?; } }
         sftp.remove_dir(path).await.map_err(|e| AppError::Ssh(e.to_string()))?;
     } else { sftp.remove_file(path).await.map_err(|e| AppError::Ssh(e.to_string()))?; }
@@ -1078,7 +1109,7 @@ async fn collect_remote_files(sftp: &SftpSession, source: &str, destination: &st
     if metadata.is_dir() {
         ensure_remote_directory(sftp, &target_root).await?;
         let entries = sftp.read_dir(source).await.map_err(|e| AppError::Ssh(e.to_string()))?;
-        for entry in entries { let child = entry.path(); let child_target = join_remote_path(&target_root, &entry.file_name()); if entry.metadata().is_dir() && !entry.metadata().is_symlink() { Box::pin(collect_remote_files(sftp, &child, &target_root, files)).await?; } else if !entry.metadata().is_symlink() { files.push((child, child_target, entry.metadata().len())); } }
+        for entry in entries { validate_remote_entry_name(&entry.file_name())?; let child = entry.path(); let child_target = join_remote_path(&target_root, &entry.file_name()); if entry.metadata().is_dir() && !entry.metadata().is_symlink() { Box::pin(collect_remote_files(sftp, &child, &target_root, files)).await?; } else if !entry.metadata().is_symlink() { files.push((child, child_target, entry.metadata().len())); } }
     } else { files.push((source.into(), target_root, metadata.len())); }
     Ok(())
 }
@@ -1170,6 +1201,13 @@ fn renamed_remote_path(requested: &str, index: u32) -> String {
     let (stem, extension) = name.rsplit_once('.').filter(|(stem, _)| !stem.is_empty())
         .map_or((name, String::new()), |(stem, ext)| (stem, format!(".{ext}")));
     format!("{directory}{stem} ({index}){extension}")
+}
+
+fn renamed_local_path(requested: &Path, index: u32) -> AppResult<PathBuf> {
+    let name = requested.file_name().and_then(|name| name.to_str())
+        .ok_or_else(|| AppError::Validation("下载目标文件名无效".into()))?;
+    // Keep the extension in its usual position, matching upload conflict names.
+    Ok(requested.with_file_name(renamed_remote_path(name, index)))
 }
 
 async fn remote_exists(sftp: &SftpSession, path: &str) -> AppResult<bool> {
@@ -1446,6 +1484,7 @@ async fn collect_remote_download(sftp: &SftpSession, source: &str, relative: Pat
         let entries = sftp.read_dir(source).await.map_err(|error| AppError::Ssh(error.to_string()))?;
         for entry in entries {
             let name = entry.file_name();
+            validate_remote_entry_name(&name)?;
             safe_remote_name(&name)?;
             Box::pin(collect_remote_download(sftp, &entry.path(), target.clone(), plan)).await?;
         }
@@ -1481,7 +1520,7 @@ async fn run_download_transfer(manager: &SshManager, host_id: &str, remote_paths
                     let original = local.clone();
                     let mut renamed = false;
                     for index in 1..=10_000u32 {
-                        let candidate = original.with_file_name(format!("{} ({index})", original.file_name().and_then(|name| name.to_str()).unwrap_or("download")));
+                        let candidate = renamed_local_path(&original, index)?;
                         if !tokio::fs::try_exists(&candidate).await.map_err(AppError::Io)? { local = candidate; renamed = true; break; }
                     }
                     if !renamed { return Err(AppError::Validation("无法为下载目标生成可用的新名称".into())); }
@@ -1580,6 +1619,11 @@ async fn socks5_connect(stream: &mut TcpStream) -> AppResult<(String, u16)> {
             let mut b = vec![0; n[0] as usize];
             stream.read_exact(&mut b).await.map_err(AppError::Io)?;
             String::from_utf8(b).map_err(|_| AppError::Validation("域名无效".into()))?
+        }
+        4 => {
+            let mut bytes = [0u8; 16];
+            stream.read_exact(&mut bytes).await.map_err(AppError::Io)?;
+            std::net::Ipv6Addr::from(bytes).to_string()
         }
         _ => return Err(AppError::Validation("不支持的 SOCKS5 地址类型".into())),
     };

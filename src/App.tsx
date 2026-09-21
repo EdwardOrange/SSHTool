@@ -17,6 +17,10 @@ import HostDialog from "./components/HostDialog";
 import ServerSidebar from "./components/ServerSidebar";
 import TransferDrawer from "./components/TransferDrawer";
 import { useAppStore } from "./store";
+import { settingsPersistence } from "./settingsPersistence";
+import { loadCommandHistory } from "./commandHistory";
+import { connectWithPrompts } from "./sshConnection";
+import { startConnectionStatusPolling } from "./connectionStatus";
 import type { HostProfile, PageId } from "./types";
 import { materialColors } from "./theme";
 import { formatError } from "./utils";
@@ -39,7 +43,8 @@ export default function App({ mode, setMode }: { mode: "light" | "dark"; setMode
   const [sidebarOpen, setSidebarOpen] = React.useState(false);
   const [actionPending, setActionPending] = React.useState(false);
   const connectionLock = React.useRef(false);
-  const hosts = useAppStore((s) => s.hosts); const setHosts = useAppStore((s) => s.setHosts); const selectedHostId = useAppStore((s) => s.selectedHostId); const page = useAppStore((s) => s.page); const setPage = useAppStore((s) => s.setPage); const upsertHost = useAppStore((s) => s.upsertHost); const removeHost = useAppStore((s) => s.removeHost); const setCommands = useAppStore((s) => s.setCommands); const addCommand = useAppStore((s) => s.addCommand); const setSettings = useAppStore((s) => s.setSettings); const settings = useAppStore((s) => s.settings);
+  const connectionRevision = React.useRef(0);
+  const hosts = useAppStore((s) => s.hosts); const setHosts = useAppStore((s) => s.setHosts); const selectedHostId = useAppStore((s) => s.selectedHostId); const page = useAppStore((s) => s.page); const setPage = useAppStore((s) => s.setPage); const removeHost = useAppStore((s) => s.removeHost); const setCommands = useAppStore((s) => s.setCommands); const addCommand = useAppStore((s) => s.addCommand); const setSettings = useAppStore((s) => s.setSettings); const settings = useAppStore((s) => s.settings);
   const [terminalHostIds, setTerminalHostIds] = React.useState<string[]>([]);
   React.useEffect(() => {
     setTerminalHostIds((previous) => {
@@ -60,8 +65,8 @@ export default function App({ mode, setMode }: { mode: "light" | "dark"; setMode
   const [passwordValue, setPasswordValue] = React.useState("");
   const [hostKeyRequest, setHostKeyRequest] = React.useState<{ host: HostProfile; fingerprint: string; resolve: (trusted: boolean) => void } | null>(null);
   const [notice, setNotice] = React.useState("");
-  const themeSaveChain = React.useRef<Promise<unknown>>(Promise.resolve());
   const host = hosts.find((item) => item.id === selectedHostId);
+  const credentialLabel = passwordRequest?.host.authMethod === "key" ? "私钥口令" : passwordRequest?.host.authMethod === "keyboardInteractive" ? "键盘交互响应" : "SSH 密码";
 
   const askPassword = React.useCallback((target: HostProfile) => new Promise<string | undefined>((resolve) => {
     setPasswordValue("");
@@ -86,17 +91,8 @@ export default function App({ mode, setMode }: { mode: "light" | "dark"; setMode
   }, [setMode]);
   const cycleTheme = () => {
     if (!settings) return;
-    const previous = settings;
     const nextTheme = mode === "dark" ? "light" : "dark";
-    const next = { ...settings, theme: nextTheme as typeof settings.theme };
-    setSettings(next);
-    applyTheme(nextTheme);
-    themeSaveChain.current = themeSaveChain.current.catch(() => undefined).then(() => api.settingsUpdate(next)).then((saved) => {
-      if (useAppStore.getState().settings === next) setSettings(saved);
-    }, (reason) => {
-      if (useAppStore.getState().settings === next) { setSettings(previous); applyTheme(previous.theme); }
-      setNotice(formatError(reason));
-    });
+    void settingsPersistence.update({ theme: nextTheme }).catch((reason) => setNotice(formatError(reason)));
   };
 
   React.useEffect(() => {
@@ -110,62 +106,53 @@ export default function App({ mode, setMode }: { mode: "light" | "dark"; setMode
   React.useEffect(() => {
     if (settings) applyTheme(settings.theme);
   }, [applyTheme, settings?.theme]);
+  React.useEffect(() => {
+    if (!settings) return;
+    void i18n.changeLanguage(settings.locale);
+    localStorage.setItem("locale", settings.locale);
+  }, [i18n, settings?.locale]);
 
   React.useEffect(() => {
     let alive = true;
-    Promise.all([api.hostsList(), api.commandLogQuery(), api.settingsGet()])
-      .then(([list, commands, settings]) => {
+    Promise.all([api.hostsList(), loadCommandHistory({ subscribe: api.commandLogSubscribe, query: api.commandLogQuery }, setCommands, addCommand, () => alive), api.settingsGet()])
+      .then(([list, , settings]) => {
         if (!alive) return;
-        setHosts(list); setCommands(commands); setSettings(settings);
+        setHosts(list); setSettings(settings);
         if (settings.locale !== i18n.language) void i18n.changeLanguage(settings.locale);
         if (pages.some((item) => item.id === settings.defaultPage)) setPage(settings.defaultPage);
       })
-      .then(() => { if (alive) return api.commandLogSubscribe((event) => alive && addCommand(event.payload)); })
       .catch((error) => alive && setStartupError(String(error)))
       .finally(() => alive && setLoading(false));
     return () => { alive = false; };
   }, [setHosts, setCommands, addCommand, setSettings, setPage, i18n]);
 
+  React.useEffect(() => startConnectionStatusPolling({
+    listHosts: api.hostsList,
+    getHosts: () => useAppStore.getState().hosts,
+    updateConnection: (id, patch) => useAppStore.getState().updateHostConnection(id, patch),
+    operationRevision: () => connectionRevision.current,
+    operationPending: () => connectionLock.current,
+  }), []);
+
   const toggleConnection = async () => {
     if (!host || connectionLock.current) return;
     connectionLock.current = true;
+    connectionRevision.current += 1;
     setConnecting(true);
     try {
-      if (host.status === "connected") { await api.sshDisconnect(host.id); upsertHost({ ...host, status: "disconnected" }, false); }
+      if (host.status === "connected") { await api.sshDisconnect(host.id); useAppStore.getState().updateHostConnection(host.id, { status: "disconnected" }); }
       else {
-        let password: string | undefined;
-        if ((host.authMethod === "password" || host.authMethod === "keyboardInteractive") && !host.credentialId) {
-          password = await askPassword(host);
-          if (!password) return;
-        }
-        try {
-          await api.sshConnect(host.id, password);
-        } catch (firstError) {
-          const fingerprint = await api.sshHostKeyPending(host.id);
-          if (!fingerprint || !(await askHostKeyTrust(host, fingerprint))) throw firstError;
-          await api.sshTrustHostKey(host.id, fingerprint);
-          await api.sshConnect(host.id, password);
-        }
-        upsertHost({ ...host, status: "connected", lastConnectedAt: new Date().toISOString() }, false);
+        if (!(await connectWithPrompts(host, api, askPassword, askHostKeyTrust))) return;
+        useAppStore.getState().updateHostConnection(host.id, { status: "connected", lastConnectedAt: new Date().toISOString() });
       }
-    } catch (error) { upsertHost({ ...host, status: "error" }, false); setNotice(formatError(error)); }
+    } catch (error) { useAppStore.getState().updateHostConnection(host.id, { status: "error" }); setNotice(formatError(error)); }
     finally { connectionLock.current = false; setConnecting(false); }
   };
 
   const changeLanguage = () => {
     const next = i18n.language.startsWith("zh") ? "en" : "zh";
-    const previous = useAppStore.getState().settings;
-    if (!previous) return;
-    const updated = { ...previous, locale: next as "zh" | "en" };
-    void i18n.changeLanguage(next); localStorage.setItem("locale", next); setSettings(updated);
-    themeSaveChain.current = themeSaveChain.current.catch(() => undefined).then(() => api.settingsUpdate(updated)).then((saved) => {
-      if (useAppStore.getState().settings === updated) setSettings(saved);
-    }, (reason) => {
-      if (useAppStore.getState().settings === updated) {
-        setSettings(previous); void i18n.changeLanguage(previous.locale); localStorage.setItem("locale", previous.locale);
-      }
-      setNotice(formatError(reason));
-    });
+    if (!settings) return;
+    void settingsPersistence.update({ locale: next }).catch((reason) => setNotice(formatError(reason)));
   };
 
   const openAddHost = () => { setSidebarOpen(false); setEditingHost(undefined); setHostDialog(true); };
@@ -184,16 +171,17 @@ export default function App({ mode, setMode }: { mode: "light" | "dark"; setMode
     } catch (error) { setNotice(formatError(error)); }
   };
   const executeConfirmedAction = async () => {
-    if (!confirmAction || actionPending) return;
+    if (!confirmAction || actionPending || connectionLock.current) return;
+    connectionLock.current = true;
+    connectionRevision.current += 1;
     setActionPending(true);
     const target = confirmAction.host;
     try {
       if (confirmAction.kind === "edit") {
         await api.sshDisconnect(target.id);
-        const disconnected = { ...target, status: "disconnected" as const };
-        upsertHost(disconnected);
-        setEditingHost(disconnected);
-        setHostDialog(true);
+        useAppStore.getState().updateHostConnection(target.id, { status: "disconnected" });
+        const disconnected = useAppStore.getState().hosts.find((item) => item.id === target.id);
+        if (disconnected) { setEditingHost(disconnected); setHostDialog(true); }
       } else {
         await api.hostsDelete(target.id);
         removeHost(target.id);
@@ -201,7 +189,7 @@ export default function App({ mode, setMode }: { mode: "light" | "dark"; setMode
       }
       setConfirmAction(null);
     } catch (error) { setNotice(formatError(error)); }
-    finally { setActionPending(false); }
+    finally { connectionLock.current = false; setActionPending(false); }
   };
 
   return <Box sx={{ height: "100%", display: "flex", flexDirection: "column" }}>
@@ -228,10 +216,12 @@ export default function App({ mode, setMode }: { mode: "light" | "dark"; setMode
       <DialogActions><Button disabled={actionPending} onClick={() => setConfirmAction(null)}>取消</Button><Button disabled={actionPending} color={confirmAction?.kind === "delete" ? "error" : "primary"} variant="contained" onClick={() => void executeConfirmedAction()}>{confirmAction?.kind === "delete" ? "确认删除" : "断开并编辑"}</Button></DialogActions>
     </Dialog>
     <Dialog open={Boolean(passwordRequest)} onClose={() => finishPasswordRequest()} maxWidth="xs" fullWidth>
-      <DialogTitle>输入 SSH 密码</DialogTitle>
+      <DialogTitle>输入{credentialLabel}</DialogTitle>
       <DialogContent>
-        <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>请输入“{passwordRequest?.host.name}”的登录密码。</Typography>
-        <TextField autoFocus fullWidth type="password" label="SSH 密码" value={passwordValue} onChange={(event) => setPasswordValue(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") finishPasswordRequest(passwordValue || undefined); }} />
+        <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>请输入“{passwordRequest?.host.name}”的{credentialLabel}。</Typography>
+        {passwordRequest?.host.authMethod === "key" && <Alert severity="info" sx={{ mb: 2 }}>此口令仅用于本次连接解密私钥；需要保存时请在服务器编辑页设置。</Alert>}
+        {passwordRequest?.host.authMethod === "keyboardInteractive" && <Alert severity="info" sx={{ mb: 2 }}>仅支持单次响应认证，不支持需要多个不同回答的多步 MFA。</Alert>}
+        <TextField autoFocus fullWidth type="password" label={credentialLabel} value={passwordValue} onChange={(event) => setPasswordValue(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && passwordValue) finishPasswordRequest(passwordValue); }} />
       </DialogContent>
       <DialogActions><Button onClick={() => finishPasswordRequest()}>取消</Button><Button variant="contained" onClick={() => finishPasswordRequest(passwordValue || undefined)} disabled={!passwordValue}>连接</Button></DialogActions>
     </Dialog>

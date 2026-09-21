@@ -4,9 +4,10 @@ use crate::{
 };
 use parking_lot::Mutex;
 use rusqlite::{Connection, OptionalExtension, params};
-use std::path::Path;
+use std::{path::Path, sync::Arc};
 
-pub struct Database(pub Mutex<Connection>);
+type CommandSink = Arc<dyn Fn(CommandRecord) + Send + Sync>;
+pub struct Database(pub Mutex<Connection>, Mutex<Option<CommandSink>>);
 
 impl Database {
     pub fn open(path: &Path) -> AppResult<Self> {
@@ -29,7 +30,7 @@ impl Database {
         // Keep those records for migration, but do not use them until the
         // endpoint has been explicitly confirmed again.
         let _ = connection.execute("ALTER TABLE known_hosts ADD COLUMN endpoint TEXT NOT NULL DEFAULT ''", []);
-        Ok(Self(Mutex::new(connection)))
+        Ok(Self(Mutex::new(connection), Mutex::new(None)))
     }
 
     pub fn hosts_list(&self) -> AppResult<Vec<HostProfile>> {
@@ -81,15 +82,20 @@ impl Database {
         connection.execute("UPDATE hosts SET data=?2,updated_at=?3 WHERE id=?1", params![id, data, host.updated_at])?;
         Ok(())
     }
-    pub fn hosts_upsert(&self, hosts: &[HostProfile]) -> AppResult<()> {
+    pub fn hosts_import(&self, hosts: &[HostProfile]) -> AppResult<Vec<HostProfile>> {
         let mut connection = self.0.lock();
         let transaction = connection.transaction()?;
+        let mut inserted = Vec::new();
         for host in hosts {
             let data = serde_json::to_string(host).map_err(|e| AppError::Other(e.to_string()))?;
-            transaction.execute("INSERT INTO hosts(id,data,created_at,updated_at) VALUES(?1,?2,?3,?4) ON CONFLICT(id) DO UPDATE SET data=excluded.data,updated_at=excluded.updated_at", params![host.id, data, host.created_at, host.updated_at])?;
+            // Resolve duplicates inside the transaction: another import or save
+            // may have inserted the host since the import file was read.
+            if transaction.execute("INSERT INTO hosts(id,data,created_at,updated_at) VALUES(?1,?2,?3,?4) ON CONFLICT(id) DO NOTHING", params![host.id, data, host.created_at, host.updated_at])? != 0 {
+                inserted.push(host.clone());
+            }
         }
         transaction.commit()?;
-        Ok(())
+        Ok(inserted)
     }
     pub fn host_delete(&self, id: &str) -> AppResult<()> {
         let mut connection = self.0.lock();
@@ -114,7 +120,15 @@ impl Database {
         while connection.query_row::<i64, _, _>("SELECT COALESCE(SUM(length(CAST(data AS BLOB))),0) FROM command_log", [], |row| row.get(0)).unwrap_or(0) > retention_mb * 1024 * 1024 {
             connection.execute("DELETE FROM command_log WHERE id=(SELECT id FROM command_log ORDER BY timestamp ASC LIMIT 1)", [])?;
         }
+        // Every producer, including background monitor/firewall tasks, reaches
+        // the same live stream. Do not call consumers while holding SQLite's lock.
+        drop(connection);
+        let sink = self.1.lock().clone();
+        if let Some(sink) = sink { sink(record.clone()); }
         Ok(())
+    }
+    pub fn set_command_sink(&self, sink: CommandSink) {
+        *self.1.lock() = Some(sink);
     }
     pub fn commands(&self, host_id: Option<&str>) -> AppResult<Vec<CommandRecord>> {
         let connection = self.0.lock();
@@ -260,5 +274,29 @@ mod tests {
         let commands = database.commands(None).unwrap();
         assert_eq!(commands.len(), 1);
         assert_eq!(commands[0].id, "normal");
+    }
+
+    #[test]
+    fn all_audit_sources_notify_after_persistence_without_holding_the_database_lock() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = Arc::new(Database::open(&directory.path().join("test.db")).unwrap());
+        let weak_database = Arc::downgrade(&database);
+        let emitted = Arc::new(Mutex::new(Vec::new()));
+        let observed = emitted.clone();
+        database.set_command_sink(Arc::new(move |record| {
+            let database = weak_database.upgrade().unwrap();
+            assert!(database.0.try_lock().is_some(), "callbacks must run after releasing SQLite");
+            assert!(database.commands(None).unwrap().iter().any(|saved| saved.id == record.id));
+            observed.lock().push(record.source);
+        }));
+        for source in ["monitor", "firewall", "terminal"] {
+            let mut record = terminal_record(source, "test-only");
+            record.source = source.into();
+            database.command_add(&record).unwrap();
+        }
+        assert_eq!(&*emitted.lock(), &["monitor", "firewall", "terminal"]);
+        database.0.lock().execute("DROP TABLE command_log", []).unwrap();
+        assert!(database.command_add(&terminal_record("failed", "not persisted")).is_err());
+        assert_eq!(emitted.lock().len(), 3, "failed writes must not appear as saved records");
     }
 }

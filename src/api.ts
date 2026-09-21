@@ -66,16 +66,16 @@ export const api = {
     }
   },
   async monitorQuery(hostId: string, range: string) { return isTauri() ? invoke<MetricSnapshot[]>("monitor_query", { hostId, range }) : []; },
-  async firewallRead(hostId: string): Promise<FirewallState> {
-    if (isTauri()) return invoke("firewall_read", { hostId });
+  async firewallRead(hostId: string, sudoPassword?: string, rememberSudo = false): Promise<FirewallState> {
+    if (isTauri()) return invoke("firewall_read", { hostId, sudoPassword: sudoPassword || null, rememberSudo });
     return { hostId, backend: "ufw", enabled: true, defaultInbound: "deny", defaultOutbound: "allow", stateHash: "demo-hash", rollbackAvailable: true, rules: [
       { id: "r1", direction: "in", family: "both", protocol: "tcp", ports: "22", source: "10.0.0.0/8", destination: "any", action: "allow", enabled: true, comment: "SSH 管理网络" },
       { id: "r2", direction: "in", family: "both", protocol: "tcp", ports: "80,443", source: "any", destination: "any", action: "allow", enabled: true, comment: "Web 服务" },
       { id: "r3", direction: "in", family: "both", protocol: "any", ports: "any", source: "any", destination: "any", action: "deny", enabled: true, comment: "默认拒绝", readOnly: true },
     ] };
   },
-  async firewallPlan(hostId: string, rule: FirewallRuleInput, operation: "add" | "delete" = "add"): Promise<FirewallPlan> {
-    if (isTauri()) return invoke("firewall_plan", { hostId, change: { operation, rule } });
+  async firewallPlan(hostId: string, rule: FirewallRuleInput, operation: "add" | "delete" = "add", sudoPassword?: string, rememberSudo = false): Promise<FirewallPlan> {
+    if (isTauri()) return invoke("firewall_plan", { hostId, change: { operation, rule }, sudoPassword: sudoPassword || null, rememberSudo });
     return { id: crypto.randomUUID(), hostId, stateHash: "demo-hash", summary: `允许 ${rule.protocol.toUpperCase()} ${rule.ports}`, commands: [`sudo ufw allow proto ${rule.protocol} from ${rule.source} to any port ${rule.ports} comment '${rule.comment}'`], warnings: ["将先创建 60 秒自动回滚任务，并验证新的 SSH 连接。"], risk: "medium", rollbackAvailable: true, expiresAt: new Date(Date.now() + 300_000).toISOString() };
   },
   async firewallApply(planId: string, sudoPassword?: string, rememberSudo = false): Promise<FirewallApplyResult> { return isTauri() ? invoke("firewall_apply", { planId, sudoPassword: sudoPassword || null, rememberSudo }) : { rollbackDeadline: new Date(Date.now() + 60_000).toISOString(), verified: true }; },

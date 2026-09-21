@@ -16,6 +16,10 @@ pub enum AppError {
     Permission(String),
     #[error("需要 sudo 密码")]
     SudoRequired,
+    #[error("sudo 验证失败：{0}")]
+    SudoAuthenticationFailed(String),
+    #[error("需要私钥口令")]
+    KeyPassphraseRequired,
     #[error("操作状态已变化，请重新生成计划")]
     StalePlan,
     #[error("{0}")]
@@ -41,6 +45,8 @@ impl Serialize for AppError {
             Self::NotFound(_) => "notFound",
             Self::Permission(_) => "permission",
             Self::SudoRequired => "sudoRequired",
+            Self::SudoAuthenticationFailed(_) => "sudoRequired",
+            Self::KeyPassphraseRequired => "keyPassphraseRequired",
             Self::StalePlan => "stalePlan",
             Self::Other(_) => "other",
         };

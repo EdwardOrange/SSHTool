@@ -5,6 +5,12 @@ mod models;
 mod monitor;
 mod security;
 mod ssh;
+#[cfg(test)]
+mod command_review_tests;
+#[cfg(test)]
+mod live_firewall_tests;
+#[cfg(test)]
+mod live_ssh_tests;
 
 use chrono::Utc;
 use db::Database;
@@ -15,6 +21,7 @@ use monitor::MonitorManager;
 use parking_lot::Mutex;
 use ssh::{SshManager, TerminalAuditEvent, TerminalAuditEventKind};
 use std::{
+    collections::HashMap,
     path::PathBuf,
     sync::{
         Arc,
@@ -30,15 +37,22 @@ struct AppState {
     monitor: Arc<MonitorManager>,
     firewall: Arc<FirewallManager>,
     command_channels: Arc<Mutex<Vec<Channel<StreamEnvelope<CommandRecord>>>>>,
-    command_sequence: Arc<AtomicU64>,
+    host_operations: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    forward_operations: tokio::sync::Mutex<()>,
+}
+
+impl AppState {
+    fn host_operation(&self, id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        self.host_operations.lock().entry(id.into()).or_default().clone()
+    }
 }
 
 fn emit_command(state: &AppState, record: CommandRecord) {
-    persist_and_emit_command(&state.db, &state.command_channels, &state.command_sequence, record);
+    let _ = state.db.command_add(&record);
 }
 
-fn persist_and_emit_command(db: &Database, channels: &Mutex<Vec<Channel<StreamEnvelope<CommandRecord>>>>, sequence: &AtomicU64, record: CommandRecord) {
-    if db.command_add(&record).is_err() { return; }
+fn broadcast_command(channels: &Mutex<Vec<Channel<StreamEnvelope<CommandRecord>>>>, sequence: &AtomicU64, record: CommandRecord) {
+    let mut channels = channels.lock();
     let envelope = StreamEnvelope {
         seq: sequence.fetch_add(1, Ordering::Relaxed),
         timestamp: record.timestamp.clone(),
@@ -46,7 +60,6 @@ fn persist_and_emit_command(db: &Database, channels: &Mutex<Vec<Channel<StreamEn
         session_id: None,
         payload: record,
     };
-    let mut channels = channels.lock();
     channels.retain(|channel| channel.send(envelope.clone()).is_ok());
 }
 
@@ -108,7 +121,11 @@ fn hosts_list(state: State<'_, AppState>) -> AppResult<Vec<HostProfile>> {
     Ok(hosts)
 }
 #[tauri::command]
-fn hosts_upsert(state: State<'_, AppState>, draft: HostDraft) -> AppResult<HostProfile> {
+async fn hosts_upsert(state: State<'_, AppState>, draft: HostDraft) -> AppResult<HostProfile> {
+    save_host(&state, draft).await
+}
+
+async fn save_host(state: &AppState, mut draft: HostDraft) -> AppResult<HostProfile> {
     if draft.name.trim().is_empty()
         || draft.hostname.trim().is_empty()
         || draft.username.trim().is_empty()
@@ -124,28 +141,38 @@ fn hosts_upsert(state: State<'_, AppState>, draft: HostDraft) -> AppResult<HostP
     if draft.auth_method == "key" && draft.private_key_path.as_deref().is_none_or(|path| path.trim().is_empty()) {
         return Err(AppError::Validation("请填写私钥路径".into()));
     }
+    let is_update = draft.id.is_some();
+    let id = draft.id.take().unwrap_or_else(|| Uuid::new_v4().to_string());
+    if id.trim().is_empty() { return Err(AppError::Validation("服务器 ID 不能为空".into())); }
+    // Hold the same lock as connect/delete through the database write. Checking
+    // is_connected alone misses an in-flight connection using the old address.
+    let operation = state.host_operation(&id);
+    let _guard = operation.lock().await;
+    // Jump-host connections are created recursively inside SshManager and do
+    // not pass through the Tauri command lock.
+    let connection_operation = state.ssh.connection_lock(&id);
+    let _connection_guard = connection_operation.lock().await;
     let now = Utc::now().to_rfc3339();
-    let id = draft.id.unwrap_or_else(|| Uuid::new_v4().to_string());
-    let existing = state.db.host_get(&id).ok();
+    let existing = if is_update { Some(state.db.host_get(&id)?) } else { None };
     let endpoint_changed = existing.as_ref().is_some_and(|host| host.hostname != draft.hostname.trim() || host.port != draft.port);
-    if endpoint_changed && state.ssh.is_connected(&id) {
-        return Err(AppError::Validation("修改已连接服务器的地址或端口前请先断开连接".into()));
+    if existing.as_ref().is_some_and(|host| connection_settings_changed(host, &draft)) && state.ssh.is_connected(&id) {
+        return Err(AppError::Validation("修改已连接服务器的地址、认证或跳板配置前请先断开连接".into()));
+    }
+    let old_credential_id = existing.as_ref().and_then(|host| host.credential_id.clone());
+    let mut credential_id = retained_credential_id(existing.as_ref(), &draft);
+    let mut new_credential_id = None;
+    if matches!(draft.auth_method.as_str(), "password" | "key")
+        && draft.remember_password.unwrap_or(false)
+        && let Some(password) = draft.password.as_deref().filter(|value| !value.is_empty())
+    {
+        // Do not overwrite the existing secret until the database update
+        // succeeds. Credentials are never inherited from a different host.
+        let cid = format!("ssh:{id}:{}", Uuid::new_v4());
+        security::store_secret(&cid, password)?;
+        new_credential_id = Some(cid.clone());
+        credential_id = Some(cid)
     }
     let host_key_fingerprint = if endpoint_changed { None } else { draft.host_key_fingerprint.or_else(|| existing.as_ref().and_then(|host| host.host_key_fingerprint.clone())) };
-    let old_credential_id = existing.as_ref().and_then(|host| host.credential_id.clone());
-    let mut credential_id = draft
-        .credential_id
-        .or_else(|| existing.as_ref().and_then(|h| h.credential_id.clone()));
-    if draft.auth_method != "password" || draft.remember_password == Some(false) {
-        credential_id = None;
-    }
-    if draft.auth_method == "password" && draft.remember_password.unwrap_or(false) {
-        if let Some(password) = draft.password.as_deref() {
-            let cid = credential_id.unwrap_or_else(|| format!("ssh:{id}"));
-            security::store_secret(&cid, password)?;
-            credential_id = Some(cid)
-        }
-    }
     let host = HostProfile {
         id: id.clone(),
         name: draft.name.trim().into(),
@@ -171,21 +198,56 @@ fn hosts_upsert(state: State<'_, AppState>, draft: HostDraft) -> AppResult<HostP
             .unwrap_or_else(|| now.clone()),
         updated_at: now,
     };
-    state.db.host_upsert(&host)?;
-    if old_credential_id.as_deref() != host.credential_id.as_deref() {
-        if let Some(old) = old_credential_id { let _ = security::delete_secret(&old); }
+    if let Err(error) = state.db.host_upsert(&host) {
+        if let Some(cid) = new_credential_id { let _ = security::delete_secret(&cid); }
+        return Err(error);
+    }
+    if old_credential_id.as_deref() != host.credential_id.as_deref()
+        && let Some(old) = old_credential_id
+    {
+        let _ = security::delete_secret(&old);
     }
     Ok(host)
 }
+
+fn retained_credential_id(existing: Option<&HostProfile>, draft: &HostDraft) -> Option<String> {
+    let existing = existing?;
+    if draft.remember_password == Some(false)
+        || !matches!(draft.auth_method.as_str(), "password" | "key")
+        || draft.auth_method != existing.auth_method
+        || (draft.auth_method == "key" && draft.private_key_path != existing.private_key_path)
+    {
+        return None;
+    }
+    existing.credential_id.clone()
+}
+
+fn connection_settings_changed(host: &HostProfile, draft: &HostDraft) -> bool {
+    host.hostname != draft.hostname.trim() || host.port != draft.port
+        || host.username != draft.username.trim() || host.auth_method != draft.auth_method
+        || host.private_key_path != draft.private_key_path
+        || !host.jump_hosts.iter().map(|jump| (&jump.host_id, jump.order)).eq(
+            draft.jump_hosts.as_deref().unwrap_or_default().iter().map(|jump| (&jump.host_id, jump.order))
+        )
+}
 #[tauri::command]
 async fn hosts_delete(state: State<'_, AppState>, id: String) -> AppResult<()> {
-    state.monitor.stop_host(&id);
-    if let Ok(profiles) = state.db.forward_list(&id) {
+    delete_host(&state, &id).await
+}
+
+async fn delete_host(state: &AppState, id: &str) -> AppResult<()> {
+    let operation = state.host_operation(id);
+    let _guard = operation.lock().await;
+    let _forward_guard = state.forward_operations.lock().await;
+    let connection_operation = state.ssh.connection_lock(id);
+    let _connection_guard = connection_operation.lock().await;
+    state.monitor.stop_host(id);
+    if let Ok(profiles) = state.db.forward_list(id) {
         for profile in profiles { let _ = state.ssh.forward_stop(&profile.id).await; }
     }
-    let credential_id = state.db.host_get(&id).ok().and_then(|host| host.credential_id);
-    let _ = state.ssh.disconnect(&id).await;
-    state.db.host_delete(&id)?;
+    let credential_id = state.db.host_get(id).ok().and_then(|host| host.credential_id);
+    let _ = state.ssh.disconnect_inner(id).await;
+    state.db.host_delete(id)?;
     if let Some(cid) = credential_id { let _ = security::delete_secret(&cid); }
     let _ = security::delete_secret(&format!("sudo:{id}"));
     Ok(())
@@ -205,14 +267,20 @@ async fn ssh_connect(
     host_id: String,
     password: Option<String>,
 ) -> AppResult<()> {
-    let host = state.db.host_get(&host_id)?;
+    connect_host(&state, &host_id, password).await
+}
+
+async fn connect_host(state: &AppState, host_id: &str, password: Option<String>) -> AppResult<()> {
+    let operation = state.host_operation(host_id);
+    let _guard = operation.lock().await;
+    let host = state.db.host_get(host_id)?;
     let started = std::time::Instant::now();
     let result = state.ssh.connect(&state.db, host.clone(), password).await;
-    let _ = state.db.host_record_connection(&host_id, result.is_ok());
+    let _ = state.db.host_record_connection(host_id, result.is_ok());
     let record = CommandRecord {
         id: Uuid::new_v4().to_string(),
         timestamp: Utc::now().to_rfc3339(),
-        host_id: Some(host_id.clone()),
+        host_id: Some(host_id.to_owned()),
         host_name: Some(host.name),
         source: "connection".into(),
         command: format!("ssh -p {} {}@{}", host.port, host.username, host.hostname),
@@ -237,7 +305,7 @@ async fn ssh_connect(
         equivalent: Some(true),
         operation_kind: Some("connection".into()),
     };
-    emit_command(&state, record);
+    emit_command(state, record);
     result
 }
 
@@ -247,11 +315,18 @@ fn ssh_host_key_pending(state: State<'_, AppState>, host_id: String) -> Option<S
 }
 
 #[tauri::command]
-fn ssh_trust_host_key(state: State<'_, AppState>, host_id: String, fingerprint: String) -> AppResult<()> {
+async fn ssh_trust_host_key(state: State<'_, AppState>, host_id: String, fingerprint: String) -> AppResult<()> {
+    let operation = state.host_operation(&host_id);
+    let _guard = operation.lock().await;
+    let connection_operation = state.ssh.connection_lock(&host_id);
+    let _connection_guard = connection_operation.lock().await;
     state.ssh.trust_host_key(&state.db, &host_id, &fingerprint)
 }
 #[tauri::command]
 async fn ssh_disconnect(state: State<'_, AppState>, host_id: String) -> AppResult<()> {
+    let operation = state.host_operation(&host_id);
+    let _guard = operation.lock().await;
+    let _forward_guard = state.forward_operations.lock().await;
     state.monitor.stop_host(&host_id);
     state.ssh.disconnect(&host_id).await
 }
@@ -268,8 +343,6 @@ async fn terminal_open(
     let (audit_sender, mut audit_receiver) = tokio::sync::mpsc::unbounded_channel::<TerminalAuditEvent>();
     let session_id = state.ssh.terminal_open(&host_id, cols, rows, channel, command_logging.unwrap_or(true), audit_sender).await?;
     let db = state.db.clone();
-    let command_channels = state.command_channels.clone();
-    let command_sequence = state.command_sequence.clone();
     tokio::spawn(async move {
         while let Some(event) = audit_receiver.recv().await {
             let TerminalAuditEventKind::Command { command, exit_code } = event.kind else { continue };
@@ -277,7 +350,7 @@ async fn terminal_open(
             if command.trim().is_empty() || command.trim_start().starts_with("__sshops_") { continue; }
             let host_name = db.host_get(&event.host_id).ok().map(|host| host.name);
             let record = CommandRecord { id: format!("terminal:{}:{}", event.session_id, event.sequence), timestamp: event.timestamp, host_id: Some(event.host_id), host_name, source: "terminal".into(), command, stdout: String::new(), stderr: String::new(), exit_code: Some(exit_code), duration_ms: 0, status: if exit_code == 0 { "success".into() } else { "error".into() }, repeat_count: 1, equivalent: None, operation_kind: Some("terminal.shell".into()) };
-            persist_and_emit_command(&db, &command_channels, &command_sequence, record);
+            let _ = db.command_add(&record);
         }
     });
     Ok(session_id)
@@ -344,16 +417,31 @@ fn monitor_query(
 }
 
 #[tauri::command]
-async fn firewall_read(state: State<'_, AppState>, host_id: String) -> AppResult<FirewallState> {
-    state.firewall.read(&state.ssh, &host_id).await
+async fn firewall_read(
+    state: State<'_, AppState>, host_id: String,
+    sudo_password: Option<String>, remember_sudo: Option<bool>,
+) -> AppResult<FirewallState> {
+    let password = sudo_password.or_else(|| security::read_secret(&format!("sudo:{host_id}")).ok());
+    let result = state.firewall.read_with_password(&state.ssh, &host_id, password.as_deref()).await?;
+    if remember_sudo.unwrap_or(false) && let Some(password) = password.as_deref() {
+        security::store_secret(&format!("sudo:{host_id}"), password)?;
+    }
+    Ok(result)
 }
 #[tauri::command]
 async fn firewall_plan(
     state: State<'_, AppState>,
     host_id: String,
     change: FirewallChange,
+    sudo_password: Option<String>,
+    remember_sudo: Option<bool>,
 ) -> AppResult<FirewallPlan> {
-    state.firewall.plan(&state.ssh, &host_id, change).await
+    let password = sudo_password.or_else(|| security::read_secret(&format!("sudo:{host_id}")).ok());
+    let result = state.firewall.plan_with_password(&state.ssh, &host_id, change, password.as_deref()).await?;
+    if remember_sudo.unwrap_or(false) && let Some(password) = password.as_deref() {
+        security::store_secret(&format!("sudo:{host_id}"), password)?;
+    }
+    Ok(result)
 }
 #[tauri::command]
 async fn firewall_apply(
@@ -366,12 +454,11 @@ async fn firewall_apply(
     let remembered = if sudo_password.is_none() { host_id.as_deref().and_then(|id| security::read_secret(&format!("sudo:{id}")).ok()) } else { None };
     let effective_password = sudo_password.or(remembered);
     let result = state.firewall.apply(&state.ssh, &state.db, &plan_id, effective_password.as_deref()).await;
-    if result.is_ok() && remember_sudo.unwrap_or(false) {
-        if let Some(password) = effective_password.as_deref() {
-            if let Some(host_id) = host_id {
-                let _ = security::store_secret(&format!("sudo:{host_id}"), password);
-            }
-        }
+    if result.is_ok() && remember_sudo.unwrap_or(false)
+        && let Some(password) = effective_password.as_deref()
+        && let Some(host_id) = host_id
+    {
+        let _ = security::store_secret(&format!("sudo:{host_id}"), password);
     }
     result
 }
@@ -650,10 +737,11 @@ fn forward_list(state: State<'_, AppState>, host_id: String) -> AppResult<Vec<Fo
     Ok(profiles)
 }
 #[tauri::command]
-fn forward_upsert(
+async fn forward_upsert(
     state: State<'_, AppState>,
     mut profile: ForwardingProfile,
 ) -> AppResult<ForwardingProfile> {
+    let _guard = state.forward_operations.lock().await;
     state.db.host_get(&profile.host_id)?;
     if state.ssh.is_forward_active(&profile.id) { return Err(AppError::Validation("请先停止转发再修改配置".into())); }
     if profile.bind_port == 0 || profile.bind_address.trim().is_empty() {
@@ -669,6 +757,7 @@ fn forward_upsert(
 }
 #[tauri::command]
 async fn forward_start(state: State<'_, AppState>, id: String) -> AppResult<ForwardingProfile> {
+    let _guard = state.forward_operations.lock().await;
     let mut profile = state
         .db
         .forward_list("")?
@@ -714,6 +803,7 @@ async fn forward_start(state: State<'_, AppState>, id: String) -> AppResult<Forw
 }
 #[tauri::command]
 async fn forward_stop(state: State<'_, AppState>, id: String) -> AppResult<ForwardingProfile> {
+    let _guard = state.forward_operations.lock().await;
     state.ssh.forward_stop(&id).await?;
     let mut profile = state
         .db
@@ -736,20 +826,9 @@ async fn forward_stop(state: State<'_, AppState>, id: String) -> AppResult<Forwa
     );
     Ok(profile)
 }
-#[allow(dead_code)]
-fn toggle_forward(state: &State<'_, AppState>, id: &str, active: bool) -> AppResult<()> {
-    let mut profile = state
-        .db
-        .forward_list("")?
-        .into_iter()
-        .find(|p| p.id == id)
-        .ok_or_else(|| AppError::NotFound("端口转发".into()))?;
-    profile.active = active;
-    state.db.forward_upsert(&profile)
-}
-
 #[tauri::command]
 async fn forward_delete(state: State<'_, AppState>, id: String) -> AppResult<()> {
+    let _guard = state.forward_operations.lock().await;
     state.ssh.forward_stop(&id).await?;
     state.db.forward_delete(&id)
 }
@@ -780,19 +859,17 @@ fn config_export(state: State<'_, AppState>, path: PathBuf, host_id: Option<Stri
 }
 #[tauri::command]
 fn config_import(state: State<'_, AppState>, path: PathBuf) -> AppResult<Vec<HostProfile>> {
-    let value: serde_json::Value = serde_json::from_slice(&std::fs::read(path)?)
+    let hosts = parse_imported_hosts(&std::fs::read(path)?)?;
+    state.db.hosts_import(&hosts)
+}
+
+fn parse_imported_hosts(bytes: &[u8]) -> AppResult<Vec<HostProfile>> {
+    let value: serde_json::Value = serde_json::from_slice(bytes)
         .map_err(|e| AppError::Validation(e.to_string()))?;
     let mut hosts: Vec<HostProfile> =
         serde_json::from_value(value.get("hosts").cloned().unwrap_or_default())
             .map_err(|e| AppError::Validation(e.to_string()))?;
-    let existing = state
-        .db
-        .hosts_list()?
-        .into_iter()
-        .map(|h| h.id)
-        .collect::<std::collections::HashSet<_>>();
     let now = Utc::now().to_rfc3339();
-    let mut pending = Vec::new();
     let mut imported_ids = std::collections::HashSet::new();
     for host in &mut hosts {
         if host.id.trim().is_empty() || host.name.trim().is_empty() || host.hostname.trim().is_empty() || host.username.trim().is_empty() || host.port == 0 || !imported_ids.insert(host.id.clone()) { return Err(AppError::Validation("导入配置包含无效或重复的服务器字段".into())); }
@@ -809,9 +886,7 @@ fn config_import(state: State<'_, AppState>, path: PathBuf) -> AppResult<Vec<Hos
         host.last_connected_at = None;
         host.updated_at = now.clone();
         if host.created_at.is_empty() { host.created_at = now.clone(); }
-        if !existing.contains(&host.id) { pending.push(host.clone()); }
     }
-    state.db.hosts_upsert(&pending)?;
     Ok(hosts)
 }
 
@@ -840,13 +915,18 @@ pub fn run() {
                     let _ = db.forward_upsert(profile);
                 }
             }
+            let command_channels = Arc::new(Mutex::new(Vec::new()));
+            let subscribers = command_channels.clone();
+            let sequence = AtomicU64::new(1);
+            db.set_command_sink(Arc::new(move |record| broadcast_command(&subscribers, &sequence, record)));
             app.manage(AppState {
                 db,
                 ssh: Arc::new(SshManager::default()),
                 monitor: Arc::new(MonitorManager::default()),
                 firewall: Arc::new(FirewallManager::default()),
-                command_channels: Arc::new(Mutex::new(Vec::new())),
-                command_sequence: Arc::new(AtomicU64::new(1)),
+                command_channels,
+                host_operations: Mutex::new(HashMap::new()),
+                forward_operations: tokio::sync::Mutex::new(()),
             });
             Ok(())
         })
