@@ -108,7 +108,14 @@ impl Database {
         Ok(())
     }
     pub fn command_add(&self, record: &CommandRecord) -> AppResult<()> {
-        let data = serde_json::to_string(record).map_err(|e| AppError::Other(e.to_string()))?;
+        // All producers share this boundary, including connection and SFTP
+        // errors that may echo remote text. Persist and broadcast the same
+        // redacted record; individual callers must not have to remember it.
+        let mut record = record.clone();
+        record.command = crate::security::redact(&record.command);
+        record.stdout = crate::security::redact(&record.stdout);
+        record.stderr = crate::security::redact(&record.stderr);
+        let data = serde_json::to_string(&record).map_err(|e| AppError::Other(e.to_string()))?;
         let connection = self.0.lock();
         connection.execute(
             "INSERT OR REPLACE INTO command_log(id,host_id,timestamp,data) VALUES(?1,?2,?3,?4)",
@@ -142,9 +149,19 @@ impl Database {
         result.reverse();
         Ok(result)
     }
-    pub fn command_clear(&self) -> AppResult<()> {
-        self.0.lock().execute("DELETE FROM command_log", [])?;
-        Ok(())
+    pub fn command_clear(&self) -> AppResult<Vec<String>> {
+        let mut connection = self.0.lock();
+        let transaction = connection.transaction()?;
+        let ids = {
+            let mut statement = transaction.prepare("SELECT id FROM command_log")?;
+            statement.query_map([], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        transaction.execute("DELETE FROM command_log", [])?;
+        transaction.commit()?;
+        // The UI removes only these IDs. Events inserted after the clear can
+        // arrive before this command's IPC response and must remain visible.
+        Ok(ids)
     }
     pub fn command_cleanup_legacy_terminal_bootstrap(&self) -> AppResult<usize> {
         let connection = self.0.lock();
@@ -178,19 +195,45 @@ impl Database {
         Ok(())
     }
     pub fn metric_add(&self, metric: &MetricSnapshot, resolution: u32) -> AppResult<()> {
+        if !matches!(resolution, 2 | 5 | 10 | 30) {
+            return Err(AppError::Validation("监控采样间隔无效".into()));
+        }
+        let sampled_at = chrono::DateTime::parse_from_rfc3339(&metric.timestamp)
+            .map_err(|_| AppError::Validation("监控时间戳无效".into()))?;
         let data = serde_json::to_string(metric).map_err(|e| AppError::Other(e.to_string()))?;
-        let c = self.0.lock();
-        c.execute(
+        let mut c = self.0.lock();
+        let transaction = c.transaction()?;
+        transaction.execute(
             "INSERT OR REPLACE INTO metrics(host_id,timestamp,resolution,data) VALUES(?1,?2,?3,?4)",
             params![metric.host_id, metric.timestamp, resolution, data],
         )?;
-        c.execute("DELETE FROM metrics WHERE (resolution IN (2,5,10,30) AND julianday(timestamp)<julianday('now','-1 hour')) OR (resolution=60 AND julianday(timestamp)<julianday('now','-1 day')) OR (resolution=300 AND julianday(timestamp)<julianday('now','-7 days'))",[])?;
+        // Retain the latest observed sample in each minute/five-minute bucket.
+        // Without these rows, the 24-hour and seven-day history queries lose
+        // all history as soon as raw samples reach their one-hour expiry.
+        // Keep the real observation timestamp in data, and use the bucket
+        // start only as its stable database key. Late writes cannot replace a
+        // more recent observation in the same bucket.
+        for bucket in [60i64, 300] {
+            let bucket_start = chrono::DateTime::from_timestamp(sampled_at.timestamp().div_euclid(bucket) * bucket, 0)
+                .ok_or_else(|| AppError::Validation("监控时间戳超出范围".into()))?
+                .to_rfc3339();
+            transaction.execute(
+                "INSERT INTO metrics(host_id,timestamp,resolution,data) VALUES(?1,?2,?3,?4) ON CONFLICT(host_id,timestamp,resolution) DO UPDATE SET data=excluded.data WHERE julianday(json_extract(excluded.data,'$.timestamp')) > julianday(json_extract(metrics.data,'$.timestamp'))",
+                params![metric.host_id, bucket_start, bucket, data],
+            )?;
+        }
+        transaction.execute("DELETE FROM metrics WHERE (resolution IN (2,5,10,30) AND julianday(timestamp)<julianday('now','-1 hour')) OR (resolution=60 AND julianday(timestamp)<julianday('now','-1 day')) OR (resolution=300 AND julianday(timestamp)<julianday('now','-7 days'))",[])?;
+        transaction.commit()?;
         Ok(())
     }
     pub fn metrics(&self, host_id: &str, since: &str) -> AppResult<Vec<MetricSnapshot>> {
         let c = self.0.lock();
         let mut s = c.prepare(
-            "SELECT data FROM metrics WHERE host_id=?1 AND timestamp>=?2 ORDER BY timestamp",
+            "SELECT DISTINCT data FROM metrics WHERE host_id=?1 AND julianday(json_extract(data,'$.timestamp'))>=julianday(?2) AND (
+                (resolution IN (2,5,10,30) AND julianday(json_extract(data,'$.timestamp'))>=julianday('now','-1 hour')) OR
+                (resolution=60 AND julianday(json_extract(data,'$.timestamp'))<julianday('now','-1 hour') AND julianday(json_extract(data,'$.timestamp'))>=julianday('now','-1 day')) OR
+                (resolution=300 AND julianday(json_extract(data,'$.timestamp'))<julianday('now','-1 day') AND julianday(json_extract(data,'$.timestamp'))>=julianday('now','-7 days'))
+            ) ORDER BY timestamp",
         )?;
         let rows = s.query_map(params![host_id, since], |r| r.get::<_, String>(0))?;
         let mut result = Vec::new();
@@ -240,6 +283,57 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn metric_at(timestamp: chrono::DateTime<chrono::Utc>, cpu_percent: f64) -> MetricSnapshot {
+        MetricSnapshot {
+            host_id: "metric-host".into(), timestamp: timestamp.to_rfc3339(), cpu_percent,
+            memory_percent: 25.0, disk_percent: 50.0, load1: 0.5, rx_bytes_per_sec: 100.0,
+            tx_bytes_per_sec: 50.0, connection_count: 1, memory_used_bytes: 256,
+            memory_total_bytes: 1024, disk_used_bytes: 512, disk_total_bytes: 1024,
+            uptime_seconds: 500, connections: Vec::new(), top_processes: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn metric_history_retains_coarser_samples_for_a_day_and_a_week_without_duplicates() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = Database::open(&directory.path().join("test.db")).unwrap();
+        let now = chrono::Utc::now();
+        for (age, value) in [(chrono::Duration::days(8), 80.0), (chrono::Duration::days(2), 20.0),
+            (chrono::Duration::hours(2), 2.0), (chrono::Duration::minutes(2), 1.0)] {
+            database.metric_add(&metric_at(now - age, value), 2).unwrap();
+        }
+        let since = |age: chrono::Duration| (now - age).to_rfc3339();
+        let recent = database.metrics("metric-host", &since(chrono::Duration::hours(1))).unwrap();
+        assert_eq!(recent.iter().map(|sample| sample.cpu_percent).collect::<Vec<_>>(), [1.0]);
+        let day = database.metrics("metric-host", &since(chrono::Duration::days(1))).unwrap();
+        assert_eq!(day.iter().map(|sample| sample.cpu_percent).collect::<Vec<_>>(), [2.0, 1.0]);
+        let week = database.metrics("metric-host", &since(chrono::Duration::days(7))).unwrap();
+        assert_eq!(week.iter().map(|sample| sample.cpu_percent).collect::<Vec<_>>(), [20.0, 2.0, 1.0]);
+        let resolutions = database.0.lock().prepare("SELECT resolution FROM metrics ORDER BY resolution").unwrap()
+            .query_map([], |row| row.get::<_, u32>(0)).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(resolutions, [2, 60, 60, 300, 300, 300]);
+    }
+
+    #[test]
+    fn metric_buckets_keep_the_latest_observation_and_validate_before_writing() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = Database::open(&directory.path().join("test.db")).unwrap();
+        let seconds = (chrono::Utc::now() - chrono::Duration::hours(2)).timestamp();
+        let bucket = chrono::DateTime::from_timestamp(seconds.div_euclid(300) * 300, 0).unwrap();
+        let latest = metric_at(bucket + chrono::Duration::seconds(20), 80.0);
+        database.metric_add(&latest, 5).unwrap();
+        database.metric_add(&metric_at(bucket + chrono::Duration::seconds(10), 10.0), 5).unwrap();
+        let samples = database.metrics("metric-host", &(bucket - chrono::Duration::seconds(1)).to_rfc3339()).unwrap();
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples[0].cpu_percent, 80.0);
+        assert_eq!(samples[0].timestamp, latest.timestamp);
+        assert!(database.metric_add(&latest, 3).is_err());
+        let mut invalid = latest;
+        invalid.timestamp = "invalid".into();
+        assert!(database.metric_add(&invalid, 2).is_err());
+        assert_eq!(database.0.lock().query_row::<u32, _, _>("SELECT count(*) FROM metrics", [], |row| row.get(0)).unwrap(), 2);
+    }
 
     fn terminal_record(id: &str, command: &str) -> CommandRecord {
         CommandRecord {
@@ -298,5 +392,40 @@ mod tests {
         database.0.lock().execute("DROP TABLE command_log", []).unwrap();
         assert!(database.command_add(&terminal_record("failed", "not persisted")).is_err());
         assert_eq!(emitted.lock().len(), 3, "failed writes must not appear as saved records");
+    }
+
+    #[test]
+    fn every_audit_source_is_redacted_before_persistence_and_broadcast() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = Database::open(&directory.path().join("test.db")).unwrap();
+        let emitted = Arc::new(Mutex::new(Vec::new()));
+        let observed = emitted.clone();
+        database.set_command_sink(Arc::new(move |record| observed.lock().push(record)));
+        let mut record = terminal_record("sftp-error", "copy --password command-secret");
+        record.source = "sftp".into();
+        record.stdout = r#"{"token":"output-secret"}"#.into();
+        record.stderr = "password=error-secret".into();
+        database.command_add(&record).unwrap();
+        let persisted: String = database.0.lock().query_row("SELECT data FROM command_log", [], |row| row.get(0)).unwrap();
+        let broadcast = serde_json::to_string(&emitted.lock()[0]).unwrap();
+        for secret in ["command-secret", "output-secret", "error-secret"] {
+            assert!(!persisted.contains(secret));
+            assert!(!broadcast.contains(secret));
+        }
+        assert_eq!(persisted, broadcast);
+        assert_eq!(record.command, "copy --password command-secret", "callers keep their original value");
+    }
+
+    #[test]
+    fn command_clear_reports_only_deleted_records_and_preserves_later_inserts() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = Database::open(&directory.path().join("test.db")).unwrap();
+        database.command_add(&terminal_record("before", "first")).unwrap();
+        let deleted = database.command_clear().unwrap();
+        database.command_add(&terminal_record("after", "second")).unwrap();
+        assert_eq!(deleted, ["before"]);
+        assert_eq!(database.commands(None).unwrap()[0].id, "after");
+        assert_eq!(database.command_clear().unwrap(), ["after"]);
+        assert!(database.command_clear().unwrap().is_empty());
     }
 }

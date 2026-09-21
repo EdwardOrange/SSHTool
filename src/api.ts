@@ -24,10 +24,19 @@ export const api = {
     return host;
   },
   async hostsDelete(id: string) { if (isTauri()) await invoke("hosts_delete", { id }); else mockHosts = mockHosts.filter((h) => h.id !== id); },
-  async sshConnect(hostId: string, password?: string) { if (isTauri()) return invoke("ssh_connect", { hostId, password }); await new Promise((r) => setTimeout(r, 500)); },
+  async sshConnect(hostId: string, password?: string) {
+    if (isTauri()) return invoke("ssh_connect", { hostId, password });
+    await new Promise((r) => setTimeout(r, 500));
+    mockHosts = mockHosts.map((host) => host.id === hostId ? { ...host, status: "connected", lastConnectedAt: now() } : host);
+  },
   async sshHostKeyPending(hostId: string): Promise<string | null> { return isTauri() ? invoke("ssh_host_key_pending", { hostId }) : null; },
   async sshTrustHostKey(hostId: string, fingerprint: string): Promise<void> { if (isTauri()) await invoke("ssh_trust_host_key", { hostId, fingerprint }); },
-  async sshDisconnect(hostId: string) { if (isTauri()) await invoke("ssh_disconnect", { hostId }); },
+  async sshDisconnect(hostId: string) {
+    if (isTauri()) { await invoke("ssh_disconnect", { hostId }); return; }
+    mockHosts = mockHosts.map((host) => host.id === hostId ? { ...host, status: "disconnected" } : host);
+    const taskId = mockMonitorTaskByHost.get(hostId);
+    if (taskId) await api.monitorStop(taskId);
+  },
   async terminalOpen(hostId: string, cols: number, rows: number, commandLogging: boolean, onData: (data: StreamEnvelope<number[]>) => void): Promise<string> {
     if (!isTauri()) { setTimeout(() => onData({ seq: 1, timestamp: now(), hostId, sessionId: "demo-term", payload: Array.from(new TextEncoder().encode("\x1b[1;34mSSH Operations Terminal\x1b[0m\r\nConnected to demo server.\r\n\x1b[32mops@server\x1b[0m:\x1b[34m~\x1b[0m$ ")) }), 180); return "demo-term"; }
     const channel = new Channel<StreamEnvelope<number[]>>(); channel.onmessage = onData;
@@ -91,7 +100,7 @@ export const api = {
     if (!isTauri()) { const text = (records || []).map((r) => `[${r.timestamp}] ${r.hostName || "local"} $ ${r.command}\n${r.stdout}${r.stderr}`).join("\n"); const blob = new Blob([text], { type: "text/plain" }); const url = URL.createObjectURL(blob); const a = document.createElement("a"); a.href = url; a.download = path || "command-log.txt"; a.click(); URL.revokeObjectURL(url); return; }
     await invoke("command_log_export", { path, hostId: hostId || null, records: records || null });
   },
-  async commandLogClear(): Promise<void> { if (isTauri()) await invoke("command_log_clear"); },
+  async commandLogClear(): Promise<string[]> { return isTauri() ? invoke("command_log_clear") : []; },
   async configExport(path: string, hostId?: string): Promise<void> { if (isTauri()) await invoke("config_export", { path, hostId: hostId || null }); else { const host = mockHosts.find((item) => item.id === hostId); const blob = new Blob([JSON.stringify({ version: 2, hosts: host ? [{ ...host, credentialId: undefined, status: "disconnected" }] : mockHosts.map((item) => ({ ...item, credentialId: undefined, status: "disconnected" })) }, null, 2)], { type: "application/json" }); const url = URL.createObjectURL(blob); const anchor = document.createElement("a"); anchor.href = url; anchor.download = path || "ssh-config.json"; anchor.click(); URL.revokeObjectURL(url); } },
   async sftpList(hostId: string, path: string): Promise<SftpEntry[]> { return isTauri() ? invoke("sftp_list", { hostId, path }) : [{ name: "etc", path: "/etc", kind: "directory", size: 0, permissions: "drwxr-xr-x" }, { name: "var", path: "/var", kind: "directory", size: 0, permissions: "drwxr-xr-x" }, { name: "README.txt", path: "/README.txt", kind: "file", size: 4280, permissions: "-rw-r--r--", modifiedAt: now() }]; },
   async sftpUpload(hostId: string, localPaths: string[], remoteDirectory: string, onData: (event: StreamEnvelope<TransferProgress>) => void, conflictPolicy?: AppSettings["transferConflictPolicy"]): Promise<string> {

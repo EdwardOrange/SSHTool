@@ -24,11 +24,18 @@ export async function loadCommandHistory(
     }
   });
   if (!alive()) return;
-  const records = await backend.query();
-  if (!alive()) return;
-  const merged = new Map(records.map((record) => [record.id, record]));
-  for (const [id, record] of buffered) merged.set(id, record);
-  replace([...merged.values()].sort((a, b) => Date.parse(a.timestamp) - Date.parse(b.timestamp)).slice(-2000));
-  buffered.clear();
-  loaded = true;
+  try {
+    const records = await backend.query();
+    if (!alive()) return;
+    const merged = new Map(records.map((record) => [record.id, record]));
+    for (const [id, record] of buffered) merged.set(id, record);
+    replace([...merged.values()].sort((a, b) => Date.parse(a.timestamp) - Date.parse(b.timestamp)).slice(-2000));
+    buffered.clear();
+  } finally {
+    // A failed history query must not disable the already established live
+    // stream. Preserve received events while propagating the query failure.
+    loaded = true;
+    if (alive()) for (const record of buffered.values()) append(record);
+    buffered.clear();
+  }
 }

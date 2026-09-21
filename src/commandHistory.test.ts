@@ -35,4 +35,21 @@ describe("command history initialization", () => {
     await loading;
     expect(replace).not.toHaveBeenCalled(); expect(append).not.toHaveBeenCalled();
   });
+
+  it("keeps live logging working when the initial history query fails", async () => {
+    let receive!: (event: StreamEnvelope<CommandRecord>) => void;
+    let reject!: (error: Error) => void;
+    const replace = vi.fn(), append = vi.fn();
+    const loading = loadCommandHistory({ subscribe: async (callback) => { receive = callback; }, query: () => new Promise((_, fail) => { reject = fail; }) }, replace, append, () => true);
+    const failed = expect(loading).rejects.toThrow("History unavailable");
+    await Promise.resolve();
+    receive(event(record("buffered")));
+    reject(new Error("History unavailable"));
+    await failed;
+    expect(replace).not.toHaveBeenCalled();
+    expect(append).toHaveBeenCalledWith(record("buffered"));
+    receive(event(record("live")));
+    expect(append).toHaveBeenLastCalledWith(record("live"));
+    expect(append).toHaveBeenCalledTimes(2);
+  });
 });

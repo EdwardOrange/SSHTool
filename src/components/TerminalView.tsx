@@ -26,13 +26,15 @@ export default function TerminalView({ host, active = true }: { host: HostProfil
   const pasteProtectionRef = React.useRef(true);
   const auditEnabledRef = React.useRef(true);
   const sessionIdRef = React.useRef<string | undefined>(undefined);
+  const pasteRequest = React.useRef(0);
   const activeRef = React.useRef(active);
   pasteProtectionRef.current = settings?.terminalPasteProtection !== false;
   auditEnabledRef.current = settings?.terminalCommandLogging !== false;
   activeRef.current = active;
 
   React.useEffect(() => {
-    if (!containerRef.current) return;
+    setError(""); setMenu(null); setPastePreview(undefined);
+    if (!containerRef.current || host.status !== "connected") return;
     const container = containerRef.current;
     let disposed = false;
     let sessionId: string | undefined;
@@ -59,7 +61,7 @@ export default function TerminalView({ host, active = true }: { host: HostProfil
     };
     const inputSubscription = terminal.onData((data) => send(Array.from(encoder.encode(data))));
     const onPaste = (event: ClipboardEvent) => {
-      if (!pasteProtectionRef.current) return;
+      if (disposed || !activeRef.current || !pasteProtectionRef.current) return;
       const text = event.clipboardData?.getData("text/plain") || "";
       if (!text) return;
       event.preventDefault();
@@ -96,6 +98,7 @@ export default function TerminalView({ host, active = true }: { host: HostProfil
     const onKey = (event: KeyboardEvent) => { if (activeRef.current && event.ctrlKey && event.shiftKey && event.key.toLowerCase() === "c" && terminal.hasSelection()) { void navigator.clipboard.writeText(terminal.getSelection()).catch((reason) => !disposed && setError(formatError(reason))); event.preventDefault(); } };
     window.addEventListener("keydown", onKey);
     return () => {
+      pasteRequest.current += 1;
       disposed = true; inputSubscription.dispose(); resizeSubscription.dispose(); observer.disconnect(); window.removeEventListener("keydown", onKey); container.removeEventListener("paste", onPaste, true);
       const closingSession = sessionId;
       // Closing cancels a blocked backend write. Waiting for the input queue
@@ -104,7 +107,7 @@ export default function TerminalView({ host, active = true }: { host: HostProfil
       sessionIdRef.current = undefined;
       terminal.dispose(); termRef.current = null; fitAddonRef.current = null; searchAddonRef.current = null;
     };
-  }, [host.id]);
+  }, [host.id, host.status]);
 
   React.useEffect(() => {
     const sessionId = sessionIdRef.current;
@@ -120,7 +123,7 @@ export default function TerminalView({ host, active = true }: { host: HostProfil
   }, [theme.palette.mode, settings?.terminalFontSize, settings?.terminalScrollback]);
 
   React.useEffect(() => {
-    if (!active) return;
+    if (!active) { pasteRequest.current += 1; setMenu(null); setPastePreview(undefined); return; }
     const frame = window.requestAnimationFrame(() => {
       fitAddonRef.current?.fit();
       termRef.current?.focus();
@@ -131,17 +134,20 @@ export default function TerminalView({ host, active = true }: { host: HostProfil
   const copySelection = async () => { try { if (termRef.current?.hasSelection()) await navigator.clipboard.writeText(termRef.current.getSelection()); } catch (reason) { setError(formatError(reason)); } };
   const doSearch = () => { if (search) searchAddonRef.current?.findNext(search); };
   const requestPaste = async () => {
+    const terminal = termRef.current;
+    if (!terminal || !activeRef.current) return;
+    const request = ++pasteRequest.current;
     let text = "";
-    try { text = await navigator.clipboard.readText(); } catch (reason) { setError(formatError(reason)); return; }
-    if (!text) return;
-    if (pasteProtectionRef.current) setPastePreview(text); else termRef.current?.paste(text);
+    try { text = await navigator.clipboard.readText(); } catch (reason) { if (request === pasteRequest.current && activeRef.current && termRef.current === terminal) setError(formatError(reason)); return; }
+    if (!text || request !== pasteRequest.current || !activeRef.current || termRef.current !== terminal) return;
+    if (pasteProtectionRef.current) setPastePreview(text); else terminal.paste(text);
   };
   return <Stack sx={{ height: "100%", minHeight: 0 }} spacing={1}>
     <Stack direction="row" alignItems="center" spacing={1} useFlexGap flexWrap="wrap"><TerminalRounded color="primary"/><Typography variant="subtitle1" fontWeight={700}>{host.name}</Typography><Typography variant="caption" color="text.secondary" className="mono">{host.username}@{host.hostname}:{host.port}</Typography><Box sx={{ flex: 1 }}/><TextField size="small" label="搜索终端" value={search} onChange={(event) => setSearch(event.target.value)} onKeyDown={(event) => event.key === "Enter" && doSearch()} slotProps={{ input: { startAdornment: <InputAdornment position="start"><SearchRounded fontSize="small"/></InputAdornment> } }}/><Tooltip title="复制选中"><IconButton aria-label="复制终端选中内容" onClick={() => void copySelection()}><ContentCopyRounded fontSize="small"/></IconButton></Tooltip></Stack>
     {error && <Alert severity="error" onClose={() => setError("")}>{error}</Alert>}
     <Paper variant="outlined" onContextMenu={(event) => { event.preventDefault(); setMenu({ x: event.clientX, y: event.clientY }); }} sx={{ flex: 1, minHeight: 0, overflow: "hidden", bgcolor: "#0A0E14", borderRadius: "12px", p: 1.5 }}><Box ref={containerRef} sx={{ width: "100%", height: "100%" }}/></Paper>
-    <Menu open={Boolean(menu)} onClose={() => setMenu(null)} anchorReference="anchorPosition" anchorPosition={menu ? { top: menu.y, left: menu.x } : undefined}><MenuItem onClick={() => { void copySelection(); setMenu(null); }}>复制</MenuItem><MenuItem onClick={() => { void requestPaste(); setMenu(null); }}>粘贴</MenuItem><MenuItem onClick={() => { termRef.current?.selectAll(); setMenu(null); }}>全选</MenuItem><MenuItem onClick={() => { termRef.current?.clear(); setMenu(null); }}>清屏</MenuItem></Menu>
-    <Dialog open={pastePreview !== undefined} onClose={() => setPastePreview(undefined)} fullWidth maxWidth="sm"><DialogTitle>确认粘贴到 {host.name}</DialogTitle><DialogContent><Typography variant="body2" color="text.secondary" sx={{ mb: 1 }}>多行内容可能包含会立即执行的命令，请确认目标服务器和内容。</Typography><Paper variant="outlined" sx={{ p: 1.5, maxHeight: 260, overflow: "auto", bgcolor: "#0A0E14", color: "#D8DEE9" }}><Typography component="pre" className="mono" sx={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere", m: 0 }}>{pastePreview}</Typography></Paper></DialogContent><DialogActions><Button onClick={() => setPastePreview(undefined)}>取消</Button><Button variant="contained" onClick={() => { if (pastePreview !== undefined) termRef.current?.paste(pastePreview); setPastePreview(undefined); }}>发送</Button></DialogActions></Dialog>
+    <Menu open={active && Boolean(menu)} onClose={() => setMenu(null)} anchorReference="anchorPosition" anchorPosition={menu ? { top: menu.y, left: menu.x } : undefined}><MenuItem onClick={() => { void copySelection(); setMenu(null); }}>复制</MenuItem><MenuItem onClick={() => { void requestPaste(); setMenu(null); }}>粘贴</MenuItem><MenuItem onClick={() => { termRef.current?.selectAll(); setMenu(null); }}>全选</MenuItem><MenuItem onClick={() => { termRef.current?.clear(); setMenu(null); }}>清屏</MenuItem></Menu>
+    <Dialog open={active && pastePreview !== undefined} onClose={() => setPastePreview(undefined)} fullWidth maxWidth="sm"><DialogTitle>确认粘贴到 {host.name}</DialogTitle><DialogContent><Typography variant="body2" color="text.secondary" sx={{ mb: 1 }}>多行内容可能包含会立即执行的命令，请确认目标服务器和内容。</Typography><Paper variant="outlined" sx={{ p: 1.5, maxHeight: 260, overflow: "auto", bgcolor: "#0A0E14", color: "#D8DEE9" }}><Typography component="pre" className="mono" sx={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere", m: 0 }}>{pastePreview}</Typography></Paper></DialogContent><DialogActions><Button onClick={() => setPastePreview(undefined)}>取消</Button><Button variant="contained" onClick={() => { if (activeRef.current && pastePreview !== undefined) termRef.current?.paste(pastePreview); setPastePreview(undefined); }}>发送</Button></DialogActions></Dialog>
   </Stack>;
 }
 

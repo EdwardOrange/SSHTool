@@ -15,6 +15,7 @@ interface AppState {
   metrics: Record<string, MetricSnapshot[]>;
   firewall: Record<string, FirewallState>;
   commands: CommandRecord[];
+  clearedCommandIds: ReadonlySet<string>;
   commandPanelOpen: boolean;
   commandPanelHeight: number;
   transfers: Record<string, TransferTaskView>;
@@ -29,6 +30,7 @@ interface AppState {
   setFirewall: (state: FirewallState) => void;
   addCommand: (command: CommandRecord) => void;
   setCommands: (commands: CommandRecord[]) => void;
+  removeCommands: (ids: string[]) => void;
   toggleCommandPanel: () => void;
   setCommandPanelHeight: (height: number) => void;
   upsertTransfer: (progress: TransferProgress) => void;
@@ -38,14 +40,21 @@ interface AppState {
 
 const readPanelState = () => {
   if (typeof window === "undefined") return { open: false, height: 216 };
-  return {
-    open: window.localStorage.getItem("command-panel-open") === "true",
-    height: Math.max(140, Math.min(500, Number(window.localStorage.getItem("command-panel-height")) || 216)),
-  };
+  try {
+    return {
+      open: window.localStorage.getItem("command-panel-open") === "true",
+      height: Math.max(140, Math.min(500, Number(window.localStorage.getItem("command-panel-height")) || 216)),
+    };
+  } catch { return { open: false, height: 216 }; }
+};
+
+const savePanelPreference = (key: string, value: string) => {
+  // Browser storage can be disabled or exhausted. Panel controls must still work.
+  try { window.localStorage.setItem(key, value); } catch { /* Keep the in-memory preference. */ }
 };
 
 export const useAppStore = create<AppState>((set) => ({
-  hosts: [], page: "monitor", metrics: {}, firewall: {}, commands: [], commandPanelOpen: readPanelState().open, commandPanelHeight: readPanelState().height, transfers: {}, settings: undefined,
+  hosts: [], page: "monitor", metrics: {}, firewall: {}, commands: [], clearedCommandIds: new Set(), commandPanelOpen: readPanelState().open, commandPanelHeight: readPanelState().height, transfers: {}, settings: undefined,
   setHosts: (hosts) => set({ hosts: hosts.map(normalizeHost), selectedHostId: hosts[0]?.id }),
   upsertHost: (host, select = true) => set((s) => {
     const normalized = normalizeHost(host);
@@ -64,19 +73,26 @@ export const useAppStore = create<AppState>((set) => ({
   addMetric: (snapshot) => set((s) => ({ metrics: { ...s.metrics, [snapshot.hostId]: [...(s.metrics[snapshot.hostId] || []), snapshot].slice(-1800) } })),
   setFirewall: (state) => set((s) => ({ firewall: { ...s.firewall, [state.hostId]: state } })),
   addCommand: (command) => set((s) => {
+    if (s.clearedCommandIds.has(command.id)) return s;
     const exists = s.commands.some((item) => item.id === command.id);
     return { commands: exists ? s.commands.map((item) => item.id === command.id ? { ...item, ...command } : item) : [...s.commands, command].slice(-2000) };
   }),
-  setCommands: (commands) => set({ commands }),
+  setCommands: (commands) => set((state) => ({ commands: commands.filter((command) => !state.clearedCommandIds.has(command.id)) })),
+  removeCommands: (ids) => set((state) => {
+    // Persisting a record and broadcasting it are separate backend steps. A
+    // cleared ID can still arrive in an old snapshot or a delayed stream frame.
+    const removed = new Set([...state.clearedCommandIds, ...ids]);
+    return { commands: state.commands.filter((command) => !removed.has(command.id)), clearedCommandIds: removed };
+  }),
   toggleCommandPanel: () => set((s) => {
     const commandPanelOpen = !s.commandPanelOpen;
-    window.localStorage.setItem("command-panel-open", String(commandPanelOpen));
+    savePanelPreference("command-panel-open", String(commandPanelOpen));
     return { commandPanelOpen };
   }),
   updateHostConnection: (id, patch) => set((s) => ({ hosts: s.hosts.map((host) => host.id === id ? { ...host, ...patch } : host) })),
   setCommandPanelHeight: (commandPanelHeight) => {
     const next = Math.max(140, Math.min(500, Number.isFinite(commandPanelHeight) ? commandPanelHeight : 216));
-    window.localStorage.setItem("command-panel-height", String(next));
+    savePanelPreference("command-panel-height", String(next));
     set({ commandPanelHeight: next });
   },
   upsertTransfer: (progress) => set((s) => {

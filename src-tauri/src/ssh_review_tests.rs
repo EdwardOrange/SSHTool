@@ -6,6 +6,16 @@ use russh::{ChannelId, server};
 struct TestServer {
     commands: HashMap<ChannelId, Vec<u8>>,
     channels: HashMap<ChannelId, russh::Channel<server::Msg>>,
+    behavior: TestServerBehavior,
+}
+
+#[derive(Clone, Copy, Default)]
+struct TestServerBehavior {
+    reject_exec: bool,
+    reject_shell: bool,
+    reject_pty: bool,
+    reject_sftp: bool,
+    early_output: bool,
 }
 
 impl server::Handler for TestServer {
@@ -29,7 +39,7 @@ impl server::Handler for TestServer {
     }
 
     async fn subsystem_request(&mut self, channel: ChannelId, name: &str, session: &mut server::Session) -> Result<(), Self::Error> {
-        if name == "sftp" {
+        if name == "sftp" && !self.behavior.reject_sftp {
             session.channel_success(channel)?;
             let channel = self.channels.remove(&channel).unwrap();
             russh_sftp::server::run(channel.into_stream(), UnsafeDirectoryServer {
@@ -42,12 +52,22 @@ impl server::Handler for TestServer {
     }
 
     async fn exec_request(&mut self, channel: ChannelId, command: &[u8], session: &mut server::Session) -> Result<(), Self::Error> {
+        if self.behavior.reject_exec { session.channel_failure(channel)?; return Ok(()); }
+        if self.behavior.early_output { session.data(channel, b"early ".to_vec())?; }
         session.channel_success(channel)?;
         self.commands.insert(channel, command.to_vec());
         Ok(())
     }
 
+    async fn pty_request(&mut self, channel: ChannelId, _: &str, _: u32, _: u32, _: u32, _: u32, _: &[(Pty, u32)], session: &mut server::Session) -> Result<(), Self::Error> {
+        if self.behavior.reject_pty { session.channel_failure(channel)?; }
+        else { session.channel_success(channel)?; }
+        Ok(())
+    }
+
     async fn shell_request(&mut self, channel: ChannelId, session: &mut server::Session) -> Result<(), Self::Error> {
+        if self.behavior.reject_shell { session.channel_failure(channel)?; return Ok(()); }
+        if self.behavior.early_output { session.data(channel, b"early ".to_vec())?; }
         session.channel_success(channel)?;
         session.data(channel, b"before ".to_vec())?;
         session.exit_status_request(channel, 0)?;
@@ -72,6 +92,10 @@ impl server::Handler for TestServer {
 }
 
 async fn fixture() -> (tempfile::TempDir, Database, HostProfile, tokio::task::JoinHandle<()>, Arc<AtomicU64>) {
+    fixture_with_behavior(TestServerBehavior::default()).await
+}
+
+async fn fixture_with_behavior(behavior: TestServerBehavior) -> (tempfile::TempDir, Database, HostProfile, tokio::task::JoinHandle<()>, Arc<AtomicU64>) {
     let directory = tempfile::tempdir().unwrap();
     let db = Database::open(&directory.path().join("test.db")).unwrap();
     let key = ssh_key::PrivateKey::from(ssh_key::private::Ed25519Keypair::from_seed(&[7; 32]));
@@ -93,7 +117,7 @@ async fn fixture() -> (tempfile::TempDir, Database, HostProfile, tokio::task::Jo
         while let Ok((socket, _)) = listener.accept().await {
             count.fetch_add(1, Ordering::SeqCst);
             let config = config.clone();
-            sessions.spawn(async move { if let Ok(session) = server::run_stream(config, socket, TestServer::default()).await { let _ = session.await; } });
+            sessions.spawn(async move { if let Ok(session) = server::run_stream(config, socket, TestServer { behavior, ..Default::default() }).await { let _ = session.await; } });
         }
     });
     (directory, db, profile, task, accepted)
@@ -109,6 +133,64 @@ async fn command_failure_preserves_transport_and_output_after_exit_status() {
     let output = timeout(Duration::from_secs(5), manager.exec(&profile.id, "success")).await.unwrap().unwrap();
     assert_eq!(output.stdout, "before after");
     assert_eq!(output.exit_code, 0);
+    manager.disconnect(&profile.id).await.unwrap();
+    server.abort();
+}
+
+#[tokio::test]
+async fn rejected_channel_requests_fail_promptly_without_invalidating_transport() {
+    let behavior = TestServerBehavior { reject_exec: true, reject_shell: true, reject_sftp: true, ..Default::default() };
+    let (_directory, db, profile, server, _) = fixture_with_behavior(behavior).await;
+    let manager = Arc::new(SshManager::default());
+    manager.connect(&db, profile.clone(), Some("test-only".into())).await.unwrap();
+    let exec_error = timeout(Duration::from_secs(3), manager.exec(&profile.id, "denied")).await.unwrap().unwrap_err();
+    assert!(exec_error.to_string().contains("服务器拒绝执行命令"), "{exec_error}");
+    let (audit, _) = mpsc::unbounded_channel();
+    let terminal_error = timeout(Duration::from_secs(3), manager.terminal_open(&profile.id, 80, 24, IpcChannel::new(|_| Ok(())), false, audit)).await.unwrap().unwrap_err();
+    assert!(terminal_error.to_string().contains("服务器拒绝启动 Shell"), "{terminal_error}");
+    assert!(manager.terminals.read().is_empty());
+    let sftp_error = timeout(Duration::from_secs(3), manager.sftp_list(&profile.id, "/")).await.unwrap().unwrap_err();
+    assert!(sftp_error.to_string().contains("服务器拒绝启动 SFTP"), "{sftp_error}");
+    assert!(manager.is_connected(&profile.id));
+    manager.disconnect(&profile.id).await.unwrap();
+    server.abort();
+}
+
+#[tokio::test]
+async fn rejected_pty_never_registers_a_terminal() {
+    let behavior = TestServerBehavior { reject_pty: true, ..Default::default() };
+    let (_directory, db, profile, server, _) = fixture_with_behavior(behavior).await;
+    let manager = Arc::new(SshManager::default());
+    manager.connect(&db, profile.clone(), Some("test-only".into())).await.unwrap();
+    let (audit, _) = mpsc::unbounded_channel();
+    let error = timeout(Duration::from_secs(3), manager.terminal_open(&profile.id, 80, 24, IpcChannel::new(|_| Ok(())), false, audit)).await.unwrap().unwrap_err();
+    assert!(error.to_string().contains("服务器拒绝分配终端"), "{error}");
+    assert!(manager.terminals.read().is_empty());
+    assert_eq!(manager.exec(&profile.id, "success").await.unwrap().stdout, "before after");
+    manager.disconnect(&profile.id).await.unwrap();
+    server.abort();
+}
+
+#[tokio::test]
+async fn request_acknowledgement_preserves_early_exec_and_terminal_output() {
+    let behavior = TestServerBehavior { early_output: true, ..Default::default() };
+    let (_directory, db, profile, server, _) = fixture_with_behavior(behavior).await;
+    let manager = Arc::new(SshManager::default());
+    manager.connect(&db, profile.clone(), Some("test-only".into())).await.unwrap();
+    assert_eq!(manager.exec(&profile.id, "success").await.unwrap().stdout, "early before after");
+    let output = Arc::new(RwLock::new(Vec::new()));
+    let captured = output.clone();
+    let ipc = IpcChannel::new(move |message| {
+        if let tauri::ipc::InvokeResponseBody::Json(json) = message {
+            let envelope: StreamEnvelope<Vec<u8>> = serde_json::from_str(&json).unwrap();
+            captured.write().extend(envelope.payload);
+        }
+        Ok(())
+    });
+    let (audit, _) = mpsc::unbounded_channel();
+    let id = manager.terminal_open(&profile.id, 80, 24, ipc, false, audit).await.unwrap();
+    timeout(Duration::from_secs(3), async { while manager.terminals.read().contains_key(&id) { tokio::task::yield_now().await; } }).await.unwrap();
+    assert_eq!(&*output.read(), b"early before after");
     manager.disconnect(&profile.id).await.unwrap();
     server.abort();
 }
@@ -412,6 +494,75 @@ fn remote_entry_validation_keeps_posix_names_without_accepting_paths() {
     }
     for name in [".", "..", "../outside", "sub/child", "nul\0byte"] {
         assert!(validate_remote_entry_name(name).is_err(), "{name}");
+    }
+}
+
+#[test]
+fn remote_copy_preserves_posix_names_while_downloads_keep_windows_guards() {
+    for name in ["CON", "a:b", "file?", "trailing.", "back\\slash"] {
+        assert!(validate_remote_copy_target(&format!("/source/{name}"), "/destination").is_ok(), "{name}");
+        assert!(safe_remote_name(name).is_err(), "{name}");
+        assert!(validate_remote_copy_target(&format!("/source/{name}"), "/source").is_err(), "{name}");
+    }
+}
+
+struct MetadataServer {
+    permissions: Option<u32>,
+    removed: Arc<RwLock<Vec<String>>>,
+}
+
+impl russh_sftp::server::Handler for MetadataServer {
+    type Error = russh_sftp::protocol::StatusCode;
+    fn unimplemented(&self) -> Self::Error { Self::Error::OpUnsupported }
+    async fn lstat(&mut self, id: u32, _: String) -> Result<russh_sftp::protocol::Attrs, Self::Error> {
+        Ok(russh_sftp::protocol::Attrs { id, attrs: russh_sftp::protocol::FileAttributes {
+            permissions: self.permissions, size: Some(0), ..Default::default()
+        } })
+    }
+    async fn remove(&mut self, _: u32, filename: String) -> Result<russh_sftp::protocol::Status, Self::Error> {
+        self.removed.write().push(filename);
+        Err(Self::Error::Ok)
+    }
+}
+
+#[tokio::test]
+async fn special_remote_files_are_not_copied_downloaded_or_replaced() {
+    for mode in [0o010644, 0o020644, 0o060644, 0o140644] {
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let removed = Arc::new(RwLock::new(Vec::new()));
+        russh_sftp::server::run(server, MetadataServer { permissions: Some(mode), removed: removed.clone() }).await;
+        let sftp = SftpSession::new(client).await.unwrap();
+        let mut downloads = RemoteDownloadPlan::default();
+        assert!(matches!(collect_remote_download(&sftp, "/source/special", PathBuf::new(), &mut downloads).await, Err(AppError::Validation(_))), "mode {mode:o}");
+        assert!(downloads.files.is_empty() && downloads.directories.is_empty());
+        let mut copies = Vec::new();
+        assert!(matches!(collect_remote_files(&sftp, "/source/special", "/destination", &mut copies).await, Err(AppError::Validation(_))), "mode {mode:o}");
+        assert!(copies.is_empty());
+        for policy in ["overwrite", "resume"] {
+            assert!(matches!(resolve_remote_target(&sftp, "/target", policy).await, Err(AppError::Validation(_))));
+        }
+        assert!(matches!(replace_remote_file(&sftp, "/temporary", "/target", "test").await, Err(AppError::Validation(_))));
+        // Removing a selected socket/device uses REMOVE, never READDIR/RMDIR.
+        remove_remote_tree(&sftp, "/source/special").await.unwrap();
+        assert_eq!(&*removed.read(), &["/source/special"]);
+        sftp.close().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn optional_sftp_permission_fields_remain_supported() {
+    for permissions in [None, Some(0o644), Some(0o100644)] {
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        russh_sftp::server::run(server, MetadataServer { permissions, removed: Arc::new(RwLock::new(Vec::new())) }).await;
+        let sftp = SftpSession::new(client).await.unwrap();
+        let mut downloads = RemoteDownloadPlan::default();
+        collect_remote_download(&sftp, "/source/file", PathBuf::new(), &mut downloads).await.unwrap();
+        assert_eq!(downloads.files.len(), 1);
+        let mut copies = Vec::new();
+        collect_remote_files(&sftp, "/source/file", "/destination", &mut copies).await.unwrap();
+        assert_eq!(copies.len(), 1);
+        assert_eq!(resolve_remote_target(&sftp, "/target", "overwrite").await.unwrap().as_deref(), Some("/target"));
+        sftp.close().await.unwrap();
     }
 }
 

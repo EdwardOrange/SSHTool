@@ -148,7 +148,7 @@ async fn sftp_checks(manager: &Arc<SshManager>, host: &str, root: &str, local: &
     std::fs::create_dir_all(&inputs)?;
     std::fs::create_dir_all(&downloads)?;
     let file = inputs.join("数据 sample.bin");
-    let original: Vec<u8> = (0..(256 * 1024 + 17)).map(|value| (value % 251) as u8).collect();
+    let original: Vec<u8> = (0..(4 * 1024 * 1024 + 17)).map(|value| (value % 251) as u8).collect();
     std::fs::write(&file, &original)?;
     let remote = format!("{root}/数据 sample.bin");
     upload(manager, host, &file, root, "ask", "completed").await?;

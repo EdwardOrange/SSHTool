@@ -6,6 +6,7 @@ import "./i18n";
 import "./styles.css";
 import App from "./App";
 import AppErrorBoundary from "./components/AppErrorBoundary";
+import { readLocalPreference } from "./localPreferences";
 
 function Root() {
   React.useEffect(() => {
@@ -14,7 +15,10 @@ function Root() {
     return () => document.removeEventListener("contextmenu", preventBrowserMenu);
   }, []);
   const prefersDark = useMediaQuery("(prefers-color-scheme: dark)");
-  const [mode, setMode] = React.useState<"light" | "dark">(() => (localStorage.getItem("theme") as "light" | "dark") || (prefersDark ? "dark" : "light"));
+  const [mode, setMode] = React.useState<"light" | "dark">(() => {
+    const saved = readLocalPreference("theme");
+    return saved === "light" || saved === "dark" ? saved : prefersDark ? "dark" : "light";
+  });
   const theme = React.useMemo(() => buildTheme(mode), [mode]);
   return <ThemeProvider theme={theme}><CssBaseline /><App mode={mode} setMode={setMode} /></ThemeProvider>;
 }

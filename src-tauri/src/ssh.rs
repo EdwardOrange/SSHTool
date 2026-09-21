@@ -13,7 +13,7 @@ use russh::{
 use russh_sftp::client::SftpSession;
 use russh_sftp::protocol::OpenFlags;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -540,9 +540,10 @@ impl SshManager {
         let mut stdout = Vec::new(); let mut stderr = Vec::new(); let mut code = None;
         let received = timeout(Duration::from_secs(120), async {
             channel.exec(true, command).await.map_err(|e| AppError::Ssh(e.to_string()))?;
+            let mut pending = wait_channel_success(&mut channel, "执行命令").await?;
             if let Some(value) = input { channel.data_bytes(format!("{value}\n")).await.map_err(|e| AppError::Ssh(e.to_string()))?; }
             channel.eof().await.map_err(|e| AppError::Ssh(e.to_string()))?;
-            while let Some(message) = channel.wait().await { match message {
+            while let Some(message) = next_channel_message(&mut channel, &mut pending).await { match message {
                 ChannelMsg::Data { data } if stdout.len() < 8 * 1024 * 1024 => stdout.extend_from_slice(&data[..data.len().min(8 * 1024 * 1024 - stdout.len())]),
                 ChannelMsg::ExtendedData { data, .. } if stderr.len() < 8 * 1024 * 1024 => stderr.extend_from_slice(&data[..data.len().min(8 * 1024 * 1024 - stderr.len())]),
                 ChannelMsg::ExitStatus { exit_status } => { code = Some(exit_status as i32); },
@@ -561,20 +562,7 @@ impl SshManager {
 
     pub async fn sftp_list(&self, host_id: &str, path: &str) -> AppResult<Vec<SftpEntry>> {
         validate_remote_path(path)?;
-        let connection = self.connection(host_id)?;
-        let handle = connection.handle.lock().await;
-        let channel = handle
-            .channel_open_session()
-            .await
-            .map_err(|e| AppError::Ssh(e.to_string()))?;
-        channel
-            .request_subsystem(true, "sftp")
-            .await
-            .map_err(|e| AppError::Ssh(e.to_string()))?;
-        drop(handle);
-        let sftp = SftpSession::new(channel.into_stream())
-            .await
-            .map_err(|e| AppError::Ssh(e.to_string()))?;
+        let sftp = open_sftp(self, host_id).await?;
         let entries = sftp
             .read_dir(path)
             .await
@@ -582,9 +570,9 @@ impl SshManager {
             .map(|entry| {
                 validate_remote_entry_name(&entry.file_name())?;
                 let metadata = entry.metadata();
-                let kind = if metadata.is_dir() {
+                let kind = if metadata.file_type().is_dir() {
                     "directory"
-                } else if metadata.is_symlink() {
+                } else if metadata.file_type().is_symlink() {
                     "symlink"
                 } else {
                     "file"
@@ -696,7 +684,7 @@ impl SshManager {
         for path in paths {
             validate_remote_path(path)?;
             let metadata = sftp.symlink_metadata(path).await.map_err(|e| AppError::Ssh(e.to_string()))?;
-            if metadata.is_dir() && !metadata.is_symlink() { remove_remote_tree(&sftp, path).await?; }
+            if metadata.file_type().is_dir() { remove_remote_tree(&sftp, path).await?; }
             else { sftp.remove_file(path).await.map_err(|e| AppError::Ssh(e.to_string()))?; }
         }
         let _ = sftp.close().await;
@@ -749,7 +737,7 @@ impl SshManager {
                 // Relative paths and symlinked ancestors can otherwise alias the source.
                 let mut canonical_sources = Vec::new();
                 for source in &sources {
-                    if sftp.symlink_metadata(source).await.map_err(|error| AppError::Ssh(error.to_string()))?.is_symlink() { continue; }
+                    if sftp.symlink_metadata(source).await.map_err(|error| AppError::Ssh(error.to_string()))?.file_type().is_symlink() { continue; }
                     let source = sftp.canonicalize(source).await.map_err(|error| AppError::Ssh(error.to_string()))?;
                     validate_remote_copy_target(&source, &destination)?;
                     canonical_sources.push(source);
@@ -785,14 +773,11 @@ impl SshManager {
         audit_sender: mpsc::UnboundedSender<TerminalAuditEvent>,
     ) -> AppResult<String> {
         let connection = self.connection(host_id)?;
-        let handle = connection.handle.lock().await;
-        let mut channel = handle
-            .channel_open_session()
-            .await
-            .map_err(|e| AppError::Ssh(e.to_string()))?;
-        channel
+        let mut channel = open_session_channel(&connection).await?;
+        let initialized = timeout(Duration::from_secs(30), async {
+            channel
             .request_pty(
-                false,
+                true,
                 "xterm-256color",
                 cols,
                 rows,
@@ -802,11 +787,18 @@ impl SshManager {
             )
             .await
             .map_err(|e| AppError::Ssh(e.to_string()))?;
-        channel
+            let mut pending = wait_channel_success(&mut channel, "分配终端").await?;
+            channel
             .request_shell(true)
             .await
             .map_err(|e| AppError::Ssh(e.to_string()))?;
-        drop(handle);
+            pending.extend(wait_channel_success(&mut channel, "启动 Shell").await?);
+            Ok::<_, AppError>(pending)
+        }).await.map_err(|_| AppError::Ssh("终端初始化超时".into())).and_then(|result| result);
+        let mut pending = match initialized {
+            Ok(pending) => pending,
+            Err(error) => { let _ = timeout(Duration::from_secs(2), channel.close()).await; return Err(error); }
+        };
         let session_id = Uuid::new_v4().to_string();
         let (sender, mut receiver) = mpsc::channel::<TerminalCommand>(256);
         let (cancel, mut cancelled) = watch::channel(false);
@@ -844,7 +836,7 @@ impl SshManager {
                             Some(TerminalCommand::Resize(cols, rows))=>{ let _=channel.window_change(cols, rows, 0, 0).await; },
                             None=>break
                         },
-                        message=channel.wait()=>match message {
+                        message=next_channel_message(&mut channel, &mut pending)=>match message {
                             Some(ChannelMsg::Data{data})|Some(ChannelMsg::ExtendedData{data,..})=>{
                                 let (visible, audits) = if command_logging { audit_parser.push(&data) } else { (data.to_vec(), Vec::new()) };
                                 if !visible.is_empty() { let _=ipc.send(StreamEnvelope{seq:sequence.fetch_add(1,Ordering::Relaxed),timestamp:chrono::Utc::now().to_rfc3339(),host_id:hid.clone(),session_id:Some(id.clone()),payload:visible}); }
@@ -1034,21 +1026,62 @@ impl SshManager {
     }
 }
 
+async fn open_session_channel(connection: &ManagedConnection) -> AppResult<russh::Channel<client::Msg>> {
+    timeout(Duration::from_secs(30), async {
+        let handle = connection.handle.lock().await;
+        handle.channel_open_session().await.map_err(|error| AppError::Ssh(error.to_string()))
+    }).await.map_err(|_| AppError::Ssh("打开 SSH 通道超时".into()))?
+}
+
+async fn next_channel_message(channel: &mut russh::Channel<client::Msg>, pending: &mut VecDeque<ChannelMsg>) -> Option<ChannelMsg> {
+    match pending.pop_front() { Some(message) => Some(message), None => channel.wait().await }
+}
+
+async fn wait_channel_success(channel: &mut russh::Channel<client::Msg>, operation: &str) -> AppResult<VecDeque<ChannelMsg>> {
+    // Sending a want_reply request only queues the packet in russh. The peer
+    // must acknowledge it before stdin or an audit bootstrap is sent.
+    timeout(Duration::from_secs(30), async {
+        let mut pending = VecDeque::new();
+        let mut buffered_bytes = 0usize;
+        loop {
+            match channel.wait().await {
+                Some(ChannelMsg::Success) => return Ok(pending),
+                Some(ChannelMsg::Failure) => return Err(AppError::Ssh(format!("服务器拒绝{operation}"))),
+                Some(ChannelMsg::Close) | None => return Err(AppError::Ssh(format!("{operation}确认前 SSH 通道已关闭"))),
+                Some(message) => {
+                    if let ChannelMsg::Data { ref data } | ChannelMsg::ExtendedData { ref data, .. } = message {
+                        buffered_bytes = buffered_bytes.saturating_add(data.len());
+                    }
+                    if buffered_bytes > 1024 * 1024 || pending.len() >= 1024 {
+                        return Err(AppError::Ssh(format!("{operation}确认前收到过多数据")));
+                    }
+                    // Shell banners and early output must not disappear while
+                    // waiting for the request acknowledgement.
+                    pending.push_back(message);
+                }
+            }
+        }
+    }).await.map_err(|_| AppError::Ssh(format!("{operation}确认超时")))?
+}
+
 async fn open_sftp(manager: &SshManager, host_id: &str) -> AppResult<SftpSession> {
     let connection = manager.connection(host_id)?;
-    let handle = connection.handle.lock().await;
-    let channel = handle
-        .channel_open_session()
-        .await
-        .map_err(|e| AppError::Ssh(e.to_string()))?;
-    channel
-        .request_subsystem(true, "sftp")
-        .await
-        .map_err(|e| AppError::Ssh(e.to_string()))?;
-    drop(handle);
-    SftpSession::new(channel.into_stream())
-        .await
-        .map_err(|e| AppError::Ssh(e.to_string()))
+    let mut channel = open_session_channel(&connection).await?;
+    let initialized = async {
+        channel.request_subsystem(true, "sftp").await.map_err(|error| AppError::Ssh(error.to_string()))?;
+        let pending = wait_channel_success(&mut channel, "启动 SFTP").await?;
+        if pending.iter().any(|message| matches!(message, ChannelMsg::Data { .. } | ChannelMsg::ExtendedData { .. })) {
+            return Err(AppError::Ssh("SFTP 初始化前收到意外数据".into()));
+        }
+        Ok::<(), AppError>(())
+    }.await;
+    if let Err(error) = initialized {
+        let _ = timeout(Duration::from_secs(2), channel.close()).await;
+        return Err(error);
+    }
+    timeout(Duration::from_secs(30), SftpSession::new(channel.into_stream()))
+        .await.map_err(|_| AppError::Ssh("SFTP 初始化超时".into()))?
+        .map_err(|error| AppError::Ssh(error.to_string()))
 }
 
 fn validate_remote_path(path: &str) -> AppResult<()> {
@@ -1088,14 +1121,14 @@ fn validate_jump_chain(db: &Database, profile: &HostProfile, visiting: &mut Hash
 
 async fn remove_remote_tree(sftp: &SftpSession, path: &str) -> AppResult<()> {
     let metadata = sftp.symlink_metadata(path).await.map_err(|e| AppError::Ssh(e.to_string()))?;
-    if metadata.is_symlink() {
+    if metadata.file_type().is_symlink() {
         sftp.remove_file(path).await.map_err(|e| AppError::Ssh(e.to_string()))?;
         return Ok(());
     }
-    if metadata.is_dir() {
+    if metadata.file_type().is_dir() {
         let entries = sftp.read_dir(path).await.map_err(|e| AppError::Ssh(e.to_string()))?.collect::<Vec<_>>();
         for entry in &entries { validate_remote_entry_name(&entry.file_name())?; }
-        for entry in entries { let child = entry.path(); let child_meta = entry.metadata(); if child_meta.is_dir() && !child_meta.is_symlink() { Box::pin(remove_remote_tree(sftp, &child)).await?; } else { sftp.remove_file(&child).await.map_err(|e| AppError::Ssh(e.to_string()))?; } }
+        for entry in entries { let child = entry.path(); let child_meta = entry.metadata(); if child_meta.file_type().is_dir() { Box::pin(remove_remote_tree(sftp, &child)).await?; } else { sftp.remove_file(&child).await.map_err(|e| AppError::Ssh(e.to_string()))?; } }
         sftp.remove_dir(path).await.map_err(|e| AppError::Ssh(e.to_string()))?;
     } else { sftp.remove_file(path).await.map_err(|e| AppError::Ssh(e.to_string()))?; }
     Ok(())
@@ -1105,12 +1138,20 @@ async fn collect_remote_files(sftp: &SftpSession, source: &str, destination: &st
     validate_remote_path(source)?; validate_remote_path(destination)?;
     let metadata = sftp.symlink_metadata(source).await.map_err(|e| AppError::Ssh(e.to_string()))?;
     let name = source.rsplit('/').find(|v| !v.is_empty()).unwrap_or("item"); let target_root = format!("{}/{}", destination.trim_end_matches('/'), name);
-    if metadata.is_symlink() { return Ok(()); }
-    if metadata.is_dir() {
+    if metadata.file_type().is_symlink() { return Ok(()); }
+    if metadata.file_type().is_dir() {
         ensure_remote_directory(sftp, &target_root).await?;
         let entries = sftp.read_dir(source).await.map_err(|e| AppError::Ssh(e.to_string()))?;
-        for entry in entries { validate_remote_entry_name(&entry.file_name())?; let child = entry.path(); let child_target = join_remote_path(&target_root, &entry.file_name()); if entry.metadata().is_dir() && !entry.metadata().is_symlink() { Box::pin(collect_remote_files(sftp, &child, &target_root, files)).await?; } else if !entry.metadata().is_symlink() { files.push((child, child_target, entry.metadata().len())); } }
-    } else { files.push((source.into(), target_root, metadata.len())); }
+        for entry in entries {
+            validate_remote_entry_name(&entry.file_name())?;
+            let child = entry.path();
+            let child_target = join_remote_path(&target_root, &entry.file_name());
+            let metadata = entry.metadata();
+            if metadata.file_type().is_symlink() { continue; }
+            if metadata.file_type().is_dir() { Box::pin(collect_remote_files(sftp, &child, &target_root, files)).await?; }
+            else { validate_remote_regular_file(&metadata, &child)?; files.push((child, child_target, metadata.len())); }
+        }
+    } else { validate_remote_regular_file(&metadata, source)?; files.push((source.into(), target_root, metadata.len())); }
     Ok(())
 }
 
@@ -1155,7 +1196,7 @@ async fn ensure_remote_directory(sftp: &SftpSession, path: &str) -> AppResult<()
         current = join_remote_path(if current.is_empty() { "." } else { &current }, component);
         if current.starts_with("./") { current = current[2..].to_string(); }
         match sftp.symlink_metadata(&current).await {
-            Ok(metadata) if metadata.is_dir() && !metadata.is_symlink() => {}
+            Ok(metadata) if metadata.file_type().is_dir() => {}
             Ok(_) => return Err(AppError::Validation(format!("远程路径不是目录：{current}"))),
             Err(error) if sftp_not_found(&error) => sftp.create_dir(&current).await.map_err(|error| AppError::Ssh(error.to_string()))?,
             Err(error) => return Err(AppError::Ssh(error.to_string())),
@@ -1183,7 +1224,11 @@ async fn resolve_remote_target(sftp: &SftpSession, requested: &str, policy: &str
         return Ok(Some(requested.to_owned()));
     }
     match policy {
-        "overwrite" | "resume" => Ok(Some(requested.to_owned())),
+        "overwrite" | "resume" => {
+            let metadata = sftp.symlink_metadata(requested).await.map_err(|error| AppError::Ssh(error.to_string()))?;
+            validate_remote_regular_file(&metadata, requested)?;
+            Ok(Some(requested.to_owned()))
+        }
         "skip" => Ok(None),
         "rename" => {
             for index in 1..=10_000u32 {
@@ -1270,7 +1315,7 @@ async fn replace_remote_file(sftp: &SftpSession, temporary: &str, target: &str, 
     let backup = format!("{target}.sshopstmp-backup-{transfer_id}");
     let existing = match sftp.symlink_metadata(target).await {
         Ok(metadata) => {
-            if metadata.is_dir() { return Err(AppError::Validation("远程目标是目录，不能覆盖为文件".into())); }
+            validate_remote_regular_file(&metadata, target)?;
             true
         }
         Err(error) if sftp_not_found(&error) => false,
@@ -1319,9 +1364,9 @@ async fn upload_file_cancelled(sftp: &SftpSession, local: &Path, remote: &str, c
     let _ = sftp.remove_file(&temporary).await;
     let resume_offset = if conflict_policy == "resume" {
         match sftp.symlink_metadata(remote).await {
-            Ok(metadata) if metadata.is_dir() => return Err(AppError::Validation("远程目标是目录，不能续传文件".into())),
             Ok(metadata) if metadata.len() > file_total => return Err(AppError::Validation("远程目标比本地源文件更长，不能安全续传".into())),
             Ok(metadata) => {
+                validate_remote_regular_file(&metadata, remote)?;
                 let offset = metadata.len();
                 if offset > 0 && !remote_prefix_matches(sftp, remote, local, offset).await? { return Err(AppError::Validation("远程目标前缀与本地源文件不一致，已拒绝续传".into())); }
                 offset
@@ -1467,7 +1512,11 @@ fn validate_remote_copy_target(source: &str, destination: &str) -> AppResult<()>
     let normalize = |path: &str| format!("/{}", path.split('/').filter(|part| !part.is_empty() && *part != ".").collect::<Vec<_>>().join("/"));
     let source_normalized = normalize(source);
     if source_normalized == "/" { return Err(AppError::Validation("不能复制远程根目录".into())); }
-    let target = join_remote_path(&normalize(destination), safe_remote_name(&source_normalized)?);
+    // A remote-to-remote copy must retain POSIX names such as CON or a:b.
+    // Windows device-name restrictions belong only to local downloads.
+    let name = source_normalized.rsplit('/').next().unwrap_or_default();
+    validate_remote_entry_name(name)?;
+    let target = join_remote_path(&normalize(destination), name);
     if target == source_normalized || target.starts_with(&format!("{source_normalized}/")) {
         return Err(AppError::Validation("不能将远程文件或目录复制到自身内部".into()));
     }
@@ -1477,9 +1526,9 @@ fn validate_remote_copy_target(source: &str, destination: &str) -> AppResult<()>
 async fn collect_remote_download(sftp: &SftpSession, source: &str, relative: PathBuf, plan: &mut RemoteDownloadPlan) -> AppResult<()> {
     validate_remote_path(source)?;
     let metadata = sftp.symlink_metadata(source).await.map_err(|error| AppError::Ssh(error.to_string()))?;
-    if metadata.is_symlink() { return Ok(()); }
+    if metadata.file_type().is_symlink() { return Ok(()); }
     let target = relative.join(safe_remote_name(source)?);
-    if metadata.is_dir() {
+    if metadata.file_type().is_dir() {
         plan.directories.push(target.clone());
         let entries = sftp.read_dir(source).await.map_err(|error| AppError::Ssh(error.to_string()))?;
         for entry in entries {
@@ -1489,7 +1538,20 @@ async fn collect_remote_download(sftp: &SftpSession, source: &str, relative: Pat
             Box::pin(collect_remote_download(sftp, &entry.path(), target.clone(), plan)).await?;
         }
     } else {
+        validate_remote_regular_file(&metadata, source)?;
         plan.files.push((source.to_string(), target, metadata.len()));
+    }
+    Ok(())
+}
+
+fn validate_remote_regular_file(metadata: &russh_sftp::protocol::FileAttributes, path: &str) -> AppResult<()> {
+    // The SFTP permission/type field is optional. Reject an explicitly known
+    // special type, while retaining interoperability with servers that omit it.
+    // Do not use is_regular/is_dir here: those are bitflag containment checks
+    // in russh-sftp and incorrectly classify sockets and block devices.
+    let has_file_type = metadata.permissions.is_some_and(|mode| mode & 0o170000 != 0);
+    if has_file_type && !metadata.file_type().is_file() {
+        return Err(AppError::Validation(format!("远程路径不是普通文件，不能传输或覆盖：{path}")));
     }
     Ok(())
 }

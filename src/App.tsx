@@ -24,6 +24,7 @@ import { startConnectionStatusPolling } from "./connectionStatus";
 import type { HostProfile, PageId } from "./types";
 import { materialColors } from "./theme";
 import { formatError } from "./utils";
+import { writeLocalPreference } from "./localPreferences";
 
 const pages: { id: PageId; label: string }[] = [
   { id: "terminal", label: "terminal" }, { id: "monitor", label: "monitor" }, { id: "firewall", label: "firewall" }, { id: "sftp", label: "sftp" }, { id: "forwarding", label: "forwarding" },
@@ -86,7 +87,7 @@ export default function App({ mode, setMode }: { mode: "light" | "dark"; setMode
   };
   const applyTheme = React.useCallback((theme: NonNullable<typeof settings>["theme"]) => {
     const next = theme === "system" ? (window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light") : theme;
-    if (theme === "system") localStorage.removeItem("theme"); else localStorage.setItem("theme", next);
+    writeLocalPreference("theme", theme === "system" ? null : next);
     setMode(next);
   }, [setMode]);
   const cycleTheme = () => {
@@ -109,19 +110,23 @@ export default function App({ mode, setMode }: { mode: "light" | "dark"; setMode
   React.useEffect(() => {
     if (!settings) return;
     void i18n.changeLanguage(settings.locale);
-    localStorage.setItem("locale", settings.locale);
+    writeLocalPreference("locale", settings.locale);
   }, [i18n, settings?.locale]);
 
   React.useEffect(() => {
     let alive = true;
-    Promise.all([api.hostsList(), loadCommandHistory({ subscribe: api.commandLogSubscribe, query: api.commandLogQuery }, setCommands, addCommand, () => alive), api.settingsGet()])
-      .then(([list, , settings]) => {
+    // Audit history is auxiliary: a failed or slow query must not prevent
+    // connecting to servers or opening settings.
+    void loadCommandHistory({ subscribe: api.commandLogSubscribe, query: api.commandLogQuery }, setCommands, addCommand, () => alive)
+      .catch((error) => alive && setNotice(`命令历史加载失败：${formatError(error)}`));
+    Promise.all([api.hostsList(), api.settingsGet()])
+      .then(([list, settings]) => {
         if (!alive) return;
         setHosts(list); setSettings(settings);
         if (settings.locale !== i18n.language) void i18n.changeLanguage(settings.locale);
         if (pages.some((item) => item.id === settings.defaultPage)) setPage(settings.defaultPage);
       })
-      .catch((error) => alive && setStartupError(String(error)))
+      .catch((error) => alive && setStartupError(formatError(error)))
       .finally(() => alive && setLoading(false));
     return () => { alive = false; };
   }, [setHosts, setCommands, addCommand, setSettings, setPage, i18n]);

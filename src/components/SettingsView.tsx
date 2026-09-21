@@ -37,7 +37,7 @@ export default function SettingsView({ open, onClose, onTheme }: SettingsViewPro
   React.useEffect(() => {
     if (!settings) return;
     void i18n.changeLanguage(settings.locale);
-    localStorage.setItem("locale", settings.locale);
+    try { localStorage.setItem("locale", settings.locale); } catch { /* The database remains the settings source of truth. */ }
   }, [i18n, settings?.locale]);
 
   const finishWrite = (success = true) => {
@@ -108,7 +108,7 @@ export default function SettingsView({ open, onClose, onTheme }: SettingsViewPro
         {section === 0 && <Stack spacing={2} maxWidth={620}>
           <FormControl fullWidth><InputLabel id="settings-locale">语言</InputLabel><Select labelId="settings-locale" label="语言" value={settings.locale} onChange={(event) => update({ locale: event.target.value as "zh" | "en" })}><MenuItem value="zh">中文</MenuItem><MenuItem value="en">English</MenuItem></Select></FormControl>
           <FormControl fullWidth><InputLabel id="settings-theme">主题</InputLabel><Select labelId="settings-theme" label="主题" value={settings.theme} onChange={(event) => update({ theme: event.target.value as AppSettings["theme"] })}><MenuItem value="system">跟随系统</MenuItem><MenuItem value="light">浅色</MenuItem><MenuItem value="dark">深色</MenuItem></Select></FormControl>
-          <FormControl fullWidth><InputLabel id="settings-default-page">默认页面</InputLabel><Select labelId="settings-default-page" label="默认页面" value={settings.defaultPage} onChange={(event) => update({ defaultPage: event.target.value as AppSettings["defaultPage"] })}><MenuItem value="monitor">资源监控</MenuItem><MenuItem value="terminal">终端</MenuItem><MenuItem value="sftp">文件管理</MenuItem></Select></FormControl>
+          <FormControl fullWidth><InputLabel id="settings-default-page">默认页面</InputLabel><Select labelId="settings-default-page" label="默认页面" value={settings.defaultPage} onChange={(event) => update({ defaultPage: event.target.value as AppSettings["defaultPage"] })}><MenuItem value="monitor">资源监控</MenuItem><MenuItem value="terminal">终端</MenuItem><MenuItem value="sftp">文件管理</MenuItem><MenuItem value="firewall">防火墙</MenuItem><MenuItem value="forwarding">端口转发</MenuItem></Select></FormControl>
         </Stack>}
         {section === 1 && <Stack spacing={2} maxWidth={680}>
           <Typography>字体大小：{fontSizeDraft ?? settings.terminalFontSize}px</Typography><Slider aria-label="终端字号" value={fontSizeDraft ?? settings.terminalFontSize} min={11} max={22} step={1} onChange={(_, value) => setFontSizeDraft(value as number)} onChangeCommitted={(_, value) => { setFontSizeDraft(undefined); update({ terminalFontSize: value as number }); }}/>

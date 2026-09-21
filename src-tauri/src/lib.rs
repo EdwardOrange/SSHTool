@@ -519,7 +519,7 @@ fn command_log_export(
 }
 
 #[tauri::command]
-fn command_log_clear(state: State<'_, AppState>) -> AppResult<()> {
+fn command_log_clear(state: State<'_, AppState>) -> AppResult<Vec<String>> {
     state.db.command_clear()
 }
 

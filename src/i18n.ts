@@ -1,5 +1,6 @@
 import i18n from "i18next";
 import { initReactI18next } from "react-i18next";
+import { readLocalPreference } from "./localPreferences";
 
 const resources = {
   zh: { translation: {
@@ -24,5 +25,5 @@ const resources = {
   } },
 };
 
-i18n.use(initReactI18next).init({ resources, lng: localStorage.getItem("locale") || "zh", fallbackLng: "zh", interpolation: { escapeValue: false } });
+i18n.use(initReactI18next).init({ resources, lng: readLocalPreference("locale") === "en" ? "en" : "zh", fallbackLng: "zh", interpolation: { escapeValue: false } });
 export default i18n;

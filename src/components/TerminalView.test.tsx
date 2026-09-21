@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useAppStore } from "../store";
 import type { HostProfile, StreamEnvelope } from "../types";
@@ -78,5 +78,43 @@ describe("terminal lifecycle and input safety", () => {
     const envelope = { seq: 1, timestamp: "", hostId: host.id };
     act(() => { onData({ ...envelope, payload: bytes.slice(0, 2) }); onData({ ...envelope, payload: bytes.slice(2) }); });
     expect(mocks.terminals[0].write.mock.calls.map(([text]) => text).join("")).toBe("你好");
+  });
+
+  it("dismisses the paste confirmation when its server is no longer the active page", async () => {
+    const view = render(<TerminalView host={host}/>);
+    const terminal = mocks.terminals[0];
+    const paste = new Event("paste", { bubbles: true, cancelable: true });
+    Object.defineProperty(paste, "clipboardData", { value: { getData: () => "command for first host\n" } });
+    fireEvent(terminal.element, paste);
+    expect(await screen.findByRole("dialog")).toBeTruthy();
+    view.rerender(<TerminalView host={host} active={false}/>);
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    view.rerender(<TerminalView host={host}/>);
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(terminal.paste).not.toHaveBeenCalled();
+  });
+
+  it("discards a pending clipboard read after leaving and returning to the terminal", async () => {
+    const clipboard = deferred<string>();
+    vi.stubGlobal("navigator", { clipboard: { readText: vi.fn(() => clipboard.promise) } });
+    const view = render(<TerminalView host={host}/>);
+    fireEvent.contextMenu(mocks.terminals[0].element);
+    fireEvent.click(await screen.findByRole("menuitem", { name: "粘贴" }));
+    view.rerender(<TerminalView host={host} active={false}/>);
+    view.rerender(<TerminalView host={host}/>);
+    await act(async () => clipboard.resolve("stale clipboard command\n"));
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(mocks.terminals[0].paste).not.toHaveBeenCalled();
+  });
+
+  it("closes the session on disconnect and starts a fresh session on reconnect", async () => {
+    const view = render(<TerminalView host={host}/>);
+    await act(async () => {});
+    view.rerender(<TerminalView host={{ ...host, status: "disconnected" }}/>);
+    expect(mocks.terminalClose).toHaveBeenCalledWith("session-one");
+    expect(mocks.terminalOpen).toHaveBeenCalledTimes(1);
+    view.rerender(<TerminalView host={host}/>);
+    await act(async () => {});
+    expect(mocks.terminalOpen).toHaveBeenCalledTimes(2);
   });
 });
