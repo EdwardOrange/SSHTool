@@ -3,6 +3,7 @@
 //! The real application database is opened read-only; no secrets are logged.
 //! Optional SSHOPS_LIVE_HOST_NAME selects one saved host. SSHOPS_LIVE_SCOPE
 //! defaults to all; forwarding and disconnect allow focused fault retests.
+//! cleanup requires SSHOPS_LIVE_CLEANUP_PATH naming one interrupted run's UUID directory.
 use crate::{db::Database, models::{ForwardingProfile, HostProfile, StreamEnvelope, TransferProgress}, ssh::{SshManager, TerminalAuditEventKind}};
 use futures::FutureExt;
 use rusqlite::{Connection, OpenFlags};
@@ -364,7 +365,7 @@ async fn abrupt_disconnect_checks(db: &Database, host: &HostProfile) -> TestResu
 async fn trusted_saved_host_full_isolated_round_trip() -> TestResult {
     check(std::env::var("SSHOPS_LIVE_TEST").as_deref() == Ok("1"), "Set SSHOPS_LIVE_TEST=1 explicitly before running live tests")?;
     let scope = std::env::var("SSHOPS_LIVE_SCOPE").unwrap_or_else(|_| "all".into());
-    check(matches!(scope.as_str(), "all" | "forwarding" | "disconnect"), "SSHOPS_LIVE_SCOPE must be all, forwarding or disconnect")?;
+    check(matches!(scope.as_str(), "all" | "forwarding" | "disconnect" | "cleanup"), "SSHOPS_LIVE_SCOPE must be all, forwarding, disconnect or cleanup")?;
     let directory = tempfile::tempdir()?;
     let (db, host) = saved_fixture(directory.path())?;
     let manager = Arc::new(SshManager::default());
@@ -372,6 +373,19 @@ async fn trusted_saved_host_full_isolated_round_trip() -> TestResult {
     check(manager.is_connected(&host.id), "Saved key authentication did not establish a connection")?;
     manager.verify_new_connection(&db, &host.id).await?;
     println!("PASS saved key authentication and pinned host-key verification, independent reauthentication");
+    if scope == "cleanup" {
+        let path = std::env::var("SSHOPS_LIVE_CLEANUP_PATH")?;
+        let run = path.strip_prefix("/tmp/sshops-qa-").ok_or_else(|| io::Error::other("Cleanup path is outside the test namespace"))?;
+        let uuid = Uuid::parse_str(run)?;
+        check(path == format!("/tmp/sshops-qa-{uuid}"), "Cleanup path must be one exact canonical UUID test directory")?;
+        let exists = manager.exec(&host.id, &format!("test -d '{path}' && test ! -L '{path}' && test \"$(stat -c %a -- '{path}')\" = 700")).await?;
+        if exists.exit_code == 0 { manager.sftp_delete(&host.id, std::slice::from_ref(&path)).await?; }
+        let gone = manager.exec(&host.id, &format!("test ! -e '{path}' && test ! -L '{path}'")).await?;
+        check(gone.exit_code == 0, "Interrupted test directory is not private or could not be removed")?;
+        manager.disconnect(&host.id).await?;
+        println!("PASS verified cleanup of the explicitly selected interrupted run: {path}");
+        return Ok(());
+    }
     let run_id = Uuid::new_v4().to_string();
     let remote_root = format!("/tmp/sshops-qa-{run_id}");
     let create = manager.exec(&host.id, &format!("umask 077; mkdir -- '{remote_root}'")).await?;

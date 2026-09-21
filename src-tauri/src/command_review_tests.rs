@@ -1,6 +1,6 @@
 use super::*;
 
-fn fixture() -> (tempfile::TempDir, AppState) {
+pub(super) fn fixture() -> (tempfile::TempDir, AppState) {
     let directory = tempfile::tempdir().unwrap();
     let state = AppState {
         db: Arc::new(Database::open(&directory.path().join("test.db")).unwrap()),
@@ -14,7 +14,7 @@ fn fixture() -> (tempfile::TempDir, AppState) {
     (directory, state)
 }
 
-fn draft() -> HostDraft {
+pub(super) fn draft() -> HostDraft {
     HostDraft {
         id: None, name: "Test".into(), hostname: "example.invalid".into(), port: 22,
         username: "test".into(), group_name: String::new(), tags: vec![], favorite: false,
@@ -150,6 +150,51 @@ async fn saved_secrets_are_scoped_to_the_existing_host_and_authentication() {
     edit.auth_method = "agent".into();
     host.auth_method = "agent".into();
     assert_eq!(retained_credential_id(Some(&host), &edit), None);
+}
+
+#[tokio::test]
+async fn saved_ssh_credentials_are_not_reused_for_another_endpoint_or_user() {
+    let (_directory, state) = fixture();
+    let mut host = save_host(&state, draft()).await.unwrap();
+    host.credential_id = Some("saved-password-reference".into());
+    let mut edit = draft();
+    edit.remember_password = Some(true);
+    assert_eq!(retained_credential_id(Some(&host), &edit), host.credential_id);
+    edit.hostname = "other.invalid".into();
+    assert_eq!(retained_credential_id(Some(&host), &edit), None);
+    edit.hostname = host.hostname.clone();
+    edit.port = 2222;
+    assert_eq!(retained_credential_id(Some(&host), &edit), None);
+    edit.port = host.port;
+    edit.username = "other-user".into();
+    assert_eq!(retained_credential_id(Some(&host), &edit), None);
+    edit.username = format!(" {} ", host.username);
+    edit.name = "Cosmetic rename".into();
+    assert_eq!(retained_credential_id(Some(&host), &edit), host.credential_id);
+}
+
+#[tokio::test]
+async fn sudo_credentials_are_scoped_to_host_endpoint_and_user_but_not_display_fields() {
+    let (_directory, state) = fixture();
+    let host = save_host(&state, draft()).await.unwrap();
+    let original = sudo_credential_id(&host);
+    let mut edited = host.clone();
+    edited.name = "Cosmetic rename".into();
+    edited.favorite = true;
+    edited.updated_at = "later".into();
+    assert_eq!(sudo_credential_id(&edited), original);
+    for field in ["id", "hostname", "port", "username"] {
+        let mut edited = host.clone();
+        match field {
+            "id" => edited.id.push_str("-new"),
+            "hostname" => edited.hostname = "another.invalid".into(),
+            "port" => edited.port = 2222,
+            "username" => edited.username = "another-user".into(),
+            _ => unreachable!(),
+        }
+        assert_ne!(sudo_credential_id(&edited), original, "{field}");
+    }
+    assert_ne!(original, format!("sudo:{}", host.id), "unscoped legacy secrets are never implicitly trusted");
 }
 
 #[test]

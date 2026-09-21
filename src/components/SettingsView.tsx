@@ -3,7 +3,7 @@ import CloseRounded from "@mui/icons-material/CloseRounded";
 import DeleteOutlineRounded from "@mui/icons-material/DeleteOutlineRounded";
 import RestoreRounded from "@mui/icons-material/RestoreRounded";
 import SettingsRounded from "@mui/icons-material/SettingsRounded";
-import { Alert, Box, Button, CardContent, Chip, Dialog, DialogContent, DialogTitle, Divider, FormControl, FormControlLabel, IconButton, InputLabel, MenuItem, Select, Slider, Stack, Switch, Tab, Tabs, TextField, Typography } from "@mui/material";
+import { Alert, Box, Button, CardContent, Chip, Dialog, DialogContent, DialogTitle, Divider, FormControl, FormControlLabel, IconButton, InputLabel, MenuItem, Select, Slider, Stack, Switch, Tab, Tabs, TextField, Typography, type TextFieldProps } from "@mui/material";
 import React from "react";
 import { useTranslation } from "react-i18next";
 import { settingsPersistence } from "../settingsPersistence";
@@ -18,6 +18,13 @@ interface SettingsViewProps {
   onTheme: (theme: AppSettings["theme"]) => void;
 }
 
+const numericSettings = {
+  terminalScrollback: { min: 100, max: 100_000 },
+  commandRetentionDays: { min: 1, max: 3650 },
+  commandRetentionMb: { min: 10, max: 10_000 },
+};
+type NumericSetting = keyof typeof numericSettings;
+
 export default function SettingsView({ open, onClose, onTheme }: SettingsViewProps) {
   const { i18n } = useTranslation();
   const settings = useAppStore((state) => state.settings);
@@ -29,6 +36,9 @@ export default function SettingsView({ open, onClose, onTheme }: SettingsViewPro
   const writesFailed = React.useRef(false);
   const closeRequested = React.useRef(false);
   const [fontSizeDraft, setFontSizeDraft] = React.useState<number>();
+  const numberDrafts = React.useRef<Partial<Record<NumericSetting, string>>>({});
+  const [numberValues, setNumberValues] = React.useState<Partial<Record<NumericSetting, string>>>({});
+  const [numberErrors, setNumberErrors] = React.useState<Partial<Record<NumericSetting, string>>>({});
 
   React.useEffect(() => {
     if (!settings) return;
@@ -70,7 +80,44 @@ export default function SettingsView({ open, onClose, onTheme }: SettingsViewPro
       });
   };
 
+  const commitNumbers = (keys = Object.keys(numberDrafts.current) as NumericSetting[]) => {
+    const patch: Partial<AppSettings> = {};
+    const errors: Partial<Record<NumericSetting, string>> = {};
+    for (const key of keys) {
+      const draft = numberDrafts.current[key];
+      if (draft === undefined) continue;
+      const value = Number(draft);
+      const { min, max } = numericSettings[key];
+      if (!draft.trim() || !Number.isInteger(value) || value < min || value > max) {
+        errors[key] = `请输入 ${min}–${max} 之间的整数`;
+      } else if (value !== settings?.[key]) patch[key] = value;
+    }
+    if (Object.keys(errors).length) { setNumberErrors((current) => ({ ...current, ...errors })); return false; }
+    for (const key of keys) delete numberDrafts.current[key];
+    setNumberValues({ ...numberDrafts.current });
+    setNumberErrors((current) => { const next = { ...current }; for (const key of keys) delete next[key]; return next; });
+    if (Object.keys(patch).length) update(patch);
+    return true;
+  };
+
+  const numberField = (key: NumericSetting): TextFieldProps => ({
+    type: "number",
+    value: numberValues[key] ?? settings?.[key] ?? "",
+    error: Boolean(numberErrors[key]),
+    helperText: numberErrors[key],
+    slotProps: { htmlInput: { ...numericSettings[key], step: 1 } },
+    onChange: (event) => {
+      closeRequested.current = false;
+      numberDrafts.current[key] = event.target.value;
+      setNumberValues({ ...numberDrafts.current });
+      setNumberErrors((current) => ({ ...current, [key]: undefined }));
+    },
+    onBlur: () => { commitNumbers([key]); },
+    onKeyDown: (event) => { if (event.key === "Enter") { event.preventDefault(); commitNumbers([key]); } },
+  });
+
   const requestClose = () => {
+    if (!commitNumbers()) return;
     if (pendingWrites.current > 0) {
       closeRequested.current = true;
       return;
@@ -79,6 +126,7 @@ export default function SettingsView({ open, onClose, onTheme }: SettingsViewPro
   };
 
   const reset = () => {
+    numberDrafts.current = {}; setNumberValues({}); setNumberErrors({}); setFontSizeDraft(undefined);
     if (pendingWrites.current === 0) writesFailed.current = false;
     pendingWrites.current += 1;
     setSaving(true);
@@ -98,7 +146,7 @@ export default function SettingsView({ open, onClose, onTheme }: SettingsViewPro
         <IconButton aria-label="关闭设置" onClick={requestClose}><CloseRounded/></IconButton>
       </Stack>
       <Divider/>
-      <Tabs value={section} onChange={(_, value) => setSection(value)} variant="scrollable" sx={{ px: 1.5 }}>
+      <Tabs value={section} onChange={(_, value) => { if (commitNumbers()) setSection(value); }} variant="scrollable" sx={{ px: 1.5 }}>
         <Tab label="常规"/><Tab label="终端"/><Tab label="监控"/><Tab label="文件传输"/><Tab label="命令记录"/>
       </Tabs>
     </DialogTitle>
@@ -112,19 +160,19 @@ export default function SettingsView({ open, onClose, onTheme }: SettingsViewPro
         </Stack>}
         {section === 1 && <Stack spacing={2} maxWidth={680}>
           <Typography>字体大小：{fontSizeDraft ?? settings.terminalFontSize}px</Typography><Slider aria-label="终端字号" value={fontSizeDraft ?? settings.terminalFontSize} min={11} max={22} step={1} onChange={(_, value) => setFontSizeDraft(value as number)} onChangeCommitted={(_, value) => { setFontSizeDraft(undefined); update({ terminalFontSize: value as number }); }}/>
-          <TextField label="滚动缓冲行数" type="number" value={settings.terminalScrollback} onChange={(event) => update({ terminalScrollback: Math.max(100, Number(event.target.value)) })}/>
+          <TextField label="滚动缓冲行数" {...numberField("terminalScrollback")}/>
           <FormControlLabel control={<Switch checked={settings.terminalPasteProtection} onChange={(event) => update({ terminalPasteProtection: event.target.checked })}/>} label="粘贴前确认"/>
           <FormControlLabel control={<Switch checked={settings.terminalCommandLogging} onChange={(event) => update({ terminalCommandLogging: event.target.checked })}/>} label="记录终端命令（隐私保护）"/>
         </Stack>}
         {section === 2 && <Stack spacing={2} maxWidth={680}><Typography>监控采样周期</Typography><Select inputProps={{ "aria-label": "监控采样周期" }} value={settings.monitorIntervalSeconds} onChange={(event) => update({ monitorIntervalSeconds: Number(event.target.value) as AppSettings["monitorIntervalSeconds"] })}><MenuItem value={2}>2 秒</MenuItem><MenuItem value={5}>5 秒</MenuItem><MenuItem value={10}>10 秒</MenuItem><MenuItem value={30}>30 秒</MenuItem></Select><Alert severity="info">资源采样命令默认在命令记录台中隐藏，但仍保留在本地审计数据库。</Alert></Stack>}
         {section === 3 && <Stack spacing={2} maxWidth={680}><Typography>默认冲突处理</Typography><Select inputProps={{ "aria-label": "默认冲突处理" }} value={settings.transferConflictPolicy} onChange={(event) => update({ transferConflictPolicy: event.target.value as AppSettings["transferConflictPolicy"] })}><MenuItem value="ask">每次询问</MenuItem><MenuItem value="overwrite">覆盖</MenuItem><MenuItem value="skip">跳过</MenuItem><MenuItem value="rename">自动重命名</MenuItem><MenuItem value="resume">断点续传</MenuItem></Select><Alert severity="info">复制、删除和粘贴仅在同一服务器内执行。</Alert></Stack>}
-        {section === 4 && <CommandSettings settings={settings} update={update}/>} 
+        {section === 4 && <CommandSettings settings={settings} update={update} numberField={numberField}/>}
       </CardContent>}
     </DialogContent>
   </Dialog>;
 }
 
-function CommandSettings({ settings, update }: { settings: AppSettings; update: (patch: Partial<AppSettings>) => void }) {
+function CommandSettings({ settings, update, numberField }: { settings: AppSettings; update: (patch: Partial<AppSettings>) => void; numberField: (key: NumericSetting) => TextFieldProps }) {
   const hosts = useAppStore((state) => state.hosts);
   const commands = useAppStore((state) => state.commands);
   const [draft, setDraft] = React.useState("");
@@ -139,7 +187,7 @@ function CommandSettings({ settings, update }: { settings: AppSettings; update: 
   };
   return <Stack spacing={2} maxWidth={760}>
     <Typography variant="subtitle1" fontWeight={700}>保留策略</Typography>
-    <Stack direction="row" spacing={2}><TextField label="保留天数" type="number" value={settings.commandRetentionDays} onChange={(event) => update({ commandRetentionDays: Math.max(1, Number(event.target.value)) })}/><TextField label="最大容量 MB" type="number" value={settings.commandRetentionMb} onChange={(event) => update({ commandRetentionMb: Math.max(10, Number(event.target.value)) })}/></Stack>
+    <Stack direction="row" spacing={2}><TextField label="保留天数" {...numberField("commandRetentionDays")}/><TextField label="最大容量 MB" {...numberField("commandRetentionMb")}/></Stack>
     <Typography variant="subtitle1" fontWeight={700}>屏蔽规则</Typography>
     <Typography variant="body2" color="text.secondary">模块、服务器、操作类型和命令文本条件同时满足时隐藏；规则不会删除审计记录。</Typography>
     <Stack direction={{ xs: "column", sm: "row" }} useFlexGap flexWrap="wrap" spacing={1}><Select inputProps={{ "aria-label": "屏蔽规则模块" }} size="small" displayEmpty value={draftSource || ""} onChange={(event) => setDraftSource((event.target.value || undefined) as CommandSuppressionRule["source"])}><MenuItem value="">全部模块</MenuItem>{["connection", "terminal", "monitor", "firewall", "sftp", "forward", "system"].map((source) => <MenuItem key={source} value={source}>{source}</MenuItem>)}</Select><Select inputProps={{ "aria-label": "屏蔽规则操作" }} size="small" displayEmpty value={draftOperationKind || ""} onChange={(event) => setDraftOperationKind(event.target.value || undefined)}><MenuItem value="">全部操作</MenuItem>{["connection", "terminal.shell", "monitor.sample", "firewall", "sftp", "sftp.list", "forward"].map((kind) => <MenuItem key={kind} value={kind}>{kind}</MenuItem>)}</Select><Select inputProps={{ "aria-label": "屏蔽规则服务器" }} size="small" displayEmpty value={draftHost || ""} onChange={(event) => setDraftHost(event.target.value || undefined)}><MenuItem value="">全部服务器</MenuItem>{hosts.map((host) => <MenuItem key={host.id} value={host.id}>{host.name}</MenuItem>)}</Select><TextField fullWidth size="small" label="命令包含文本" value={draft} onChange={(event) => setDraft(event.target.value)} onKeyDown={(event) => event.key === "Enter" && add()}/><Button variant="contained" startIcon={<AddRounded/>} onClick={add}>添加</Button></Stack>

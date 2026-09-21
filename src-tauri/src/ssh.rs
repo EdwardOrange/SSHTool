@@ -730,6 +730,7 @@ impl SshManager {
                 }
             };
             let result = async {
+                if cancelled(&receiver) { send_transfer_state(&manager.sequence, &ipc, &hid, &tid, "cancelled", None); return Ok::<(), AppError>(()); }
                 let sftp = open_sftp(&manager, &hid).await?;
                 ensure_remote_directory(&sftp, &destination).await?;
                 let destination = sftp.canonicalize(&destination).await.map_err(|error| AppError::Ssh(error.to_string()))?;
@@ -748,12 +749,16 @@ impl SshManager {
                     if cancelled(&receiver) { let _ = sftp.close().await; send_transfer_state(&manager.sequence, &ipc, &hid, &tid, "cancelled", None); return Ok::<(), AppError>(()); }
                     let Some(target) = resolve_remote_target(&sftp, target, &conflict_policy).await? else { continue; };
                     let temporary = format!("{target}.sshopstmp-{tid}");
-                    let _ = sftp.remove_file(&temporary).await;
-                    let mut input = sftp.open(source).await.map_err(|e| AppError::Ssh(e.to_string()))?; let mut output = sftp.create(&temporary).await.map_err(|e| AppError::Ssh(e.to_string()))?; let mut buf = vec![0u8; 64 * 1024]; let mut current = 0u64; let mut last_emit = Instant::now() - Duration::from_secs(1);
-                    loop { if cancelled(&receiver) { let _ = output.close().await; let _ = sftp.remove_file(&temporary).await; let _ = sftp.close().await; send_transfer_state(&manager.sequence, &ipc, &hid, &tid, "cancelled", None); return Ok(()); } let n = input.read(&mut buf).await.map_err(|e| AppError::Ssh(e.to_string()))?; if n == 0 { break; } output.write_all(&buf[..n]).await.map_err(|e| AppError::Ssh(e.to_string()))?; current += n as u64; transferred += n as u64; if last_emit.elapsed() >= Duration::from_millis(120) || current == *size { last_emit = Instant::now(); let _ = ipc.send(StreamEnvelope { seq: manager.sequence.fetch_add(1, Ordering::Relaxed), timestamp: chrono::Utc::now().to_rfc3339(), host_id: hid.clone(), session_id: None, payload: TransferProgress { transfer_id: tid.clone(), host_id: hid.clone(), direction: "transfer".into(), current_path: source.clone(), transferred, total, status: "running".into(), error: None, file_index: index as u32 + 1, file_count: files.len() as u32, current_file_transferred: current, current_file_total: *size } }); } }
-                    output.flush().await.map_err(|e| AppError::Ssh(e.to_string()))?; output.close().await.map_err(|e| AppError::Ssh(e.to_string()))?;
-                    if let Err(error) = validate_transfer_size(*size, current) { let _ = sftp.remove_file(&temporary).await; return Err(error); }
-                    replace_remote_file(&sftp, &temporary, &target, &tid).await?;
+                    let prepare = async {
+                        let _ = sftp.remove_file(&temporary).await;
+                        let mut input = sftp.open(source).await.map_err(|e| AppError::Ssh(e.to_string()))?; let mut output = sftp.create(&temporary).await.map_err(|e| AppError::Ssh(e.to_string()))?; let mut buf = vec![0u8; 64 * 1024]; let mut current = 0u64; let mut last_emit = Instant::now() - Duration::from_secs(1);
+                        loop { let n = input.read(&mut buf).await.map_err(|e| AppError::Ssh(e.to_string()))?; if n == 0 { break; } output.write_all(&buf[..n]).await.map_err(|e| AppError::Ssh(e.to_string()))?; current += n as u64; transferred += n as u64; if last_emit.elapsed() >= Duration::from_millis(120) || current == *size { last_emit = Instant::now(); let _ = ipc.send(StreamEnvelope { seq: manager.sequence.fetch_add(1, Ordering::Relaxed), timestamp: chrono::Utc::now().to_rfc3339(), host_id: hid.clone(), session_id: None, payload: TransferProgress { transfer_id: tid.clone(), host_id: hid.clone(), direction: "transfer".into(), current_path: source.clone(), transferred, total, status: "running".into(), error: None, file_index: index as u32 + 1, file_count: files.len() as u32, current_file_transferred: current, current_file_total: *size } }); } }
+                        output.flush().await.map_err(|e| AppError::Ssh(e.to_string()))?; output.close().await.map_err(|e| AppError::Ssh(e.to_string()))?;
+                        validate_transfer_size(*size, current)
+                    };
+                    if store_remote_transfer_file(&sftp, &temporary, &target, &tid, &mut receiver, prepare).await? {
+                        let _ = sftp.close().await; send_transfer_state(&manager.sequence, &ipc, &hid, &tid, "cancelled", None); return Ok(());
+                    }
                 }
                 let _ = sftp.close().await; send_transfer_state(&manager.sequence, &ipc, &hid, &tid, "completed", None); Ok(())
             }.await;
@@ -1219,6 +1224,56 @@ fn send_transfer_state(sequence: &Arc<AtomicU64>, ipc: &IpcChannel<StreamEnvelop
 
 fn cancelled(receiver: &watch::Receiver<bool>) -> bool { *receiver.borrow() }
 
+async fn prepare_transfer_file<F>(cancel: &mut watch::Receiver<bool>, prepare: F) -> AppResult<bool>
+where F: std::future::Future<Output = AppResult<()>> {
+    if cancelled(cancel) { return Ok(true); }
+    // Drop all open file handles before the caller removes the temporary file.
+    // Cancellation also covers prefix verification, flush and a stalled peer.
+    tokio::select! {
+        biased;
+        _ = cancel.changed() => Ok(true),
+        result = prepare => result.map(|_| false),
+    }
+}
+
+async fn store_remote_transfer_file<F>(sftp: &SftpSession, temporary: &str, target: &str, transfer_id: &str, cancel: &mut watch::Receiver<bool>, prepare: F) -> AppResult<bool>
+where F: std::future::Future<Output = AppResult<()>> {
+    let result = match prepare_transfer_file(cancel, prepare).await {
+        Ok(false) if !cancelled(cancel) => {
+            // Once replacement starts, finish it (including rollback) without
+            // interruption so cancellation cannot strand the original backup.
+            replace_remote_file(sftp, temporary, target, transfer_id).await.map(|_| false)
+        }
+        Ok(_) => Ok(true),
+        Err(error) => Err(error),
+    };
+    if !matches!(result, Ok(false))
+        && let Err(error) = sftp.remove_file(temporary).await
+        && !sftp_not_found(&error)
+    {
+        let reason = result.as_ref().err().map(ToString::to_string).unwrap_or_else(|| "传输已取消".into());
+        return Err(AppError::Ssh(format!("{reason}；无法清理临时文件 {temporary}：{error}")));
+    }
+    result
+}
+
+async fn store_local_transfer_file<F>(temporary: &Path, target: &Path, transfer_id: &str, cancel: &mut watch::Receiver<bool>, prepare: F) -> AppResult<bool>
+where F: std::future::Future<Output = AppResult<()>> {
+    let result = match prepare_transfer_file(cancel, prepare).await {
+        Ok(false) if !cancelled(cancel) => replace_local_file(temporary, target, transfer_id).await.map(|_| false),
+        Ok(_) => Ok(true),
+        Err(error) => Err(error),
+    };
+    if !matches!(result, Ok(false))
+        && let Err(error) = tokio::fs::remove_file(temporary).await
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        let reason = result.as_ref().err().map(ToString::to_string).unwrap_or_else(|| "传输已取消".into());
+        return Err(AppError::Other(format!("{reason}；无法清理临时文件 {}：{error}", temporary.display())));
+    }
+    result
+}
+
 async fn resolve_remote_target(sftp: &SftpSession, requested: &str, policy: &str) -> AppResult<Option<String>> {
     if !remote_exists(sftp, requested).await? {
         return Ok(Some(requested.to_owned()));
@@ -1325,7 +1380,9 @@ async fn replace_remote_file(sftp: &SftpSession, temporary: &str, target: &str, 
         sftp.rename(target, &backup).await.map_err(|e| AppError::Ssh(e.to_string()))?;
     }
     if let Err(error) = sftp.rename(temporary, target).await {
-        if existing { let _ = sftp.rename(&backup, target).await; }
+        if existing && let Err(restore_error) = sftp.rename(&backup, target).await {
+            return Err(AppError::Ssh(format!("安装目标文件失败：{error}；恢复原文件失败：{restore_error}；原文件备份路径：{backup}")));
+        }
         return Err(AppError::Ssh(error.to_string()));
     }
     if existing { let _ = sftp.remove_file(&backup).await; }
@@ -1359,49 +1416,43 @@ async fn run_upload_transfer(manager: &SshManager, host_id: &str, local_paths: V
 }
 
 async fn upload_file_cancelled(sftp: &SftpSession, local: &Path, remote: &str, conflict_policy: &str, host_id: &str, transfer_id: &str, total: u64, transferred: &mut u64, file_total: u64, file_index: u32, file_count: u32, ipc: &IpcChannel<StreamEnvelope<TransferProgress>>, cancel: &mut watch::Receiver<bool>, sequence: &Arc<AtomicU64>) -> AppResult<bool> {
-    let mut input = tokio::fs::File::open(local).await.map_err(AppError::Io)?;
     let temporary = format!("{remote}.sshopstmp-{transfer_id}");
-    let _ = sftp.remove_file(&temporary).await;
-    let resume_offset = if conflict_policy == "resume" {
-        match sftp.symlink_metadata(remote).await {
-            Ok(metadata) if metadata.len() > file_total => return Err(AppError::Validation("远程目标比本地源文件更长，不能安全续传".into())),
-            Ok(metadata) => {
-                validate_remote_regular_file(&metadata, remote)?;
-                let offset = metadata.len();
-                if offset > 0 && !remote_prefix_matches(sftp, remote, local, offset).await? { return Err(AppError::Validation("远程目标前缀与本地源文件不一致，已拒绝续传".into())); }
-                offset
+    let prepare = async {
+        let mut input = tokio::fs::File::open(local).await.map_err(AppError::Io)?;
+        let _ = sftp.remove_file(&temporary).await;
+        let resume_offset = if conflict_policy == "resume" {
+            match sftp.symlink_metadata(remote).await {
+                Ok(metadata) if metadata.len() > file_total => return Err(AppError::Validation("远程目标比本地源文件更长，不能安全续传".into())),
+                Ok(metadata) => {
+                    validate_remote_regular_file(&metadata, remote)?;
+                    let offset = metadata.len();
+                    if offset > 0 && !remote_prefix_matches(sftp, remote, local, offset).await? { return Err(AppError::Validation("远程目标前缀与本地源文件不一致，已拒绝续传".into())); }
+                    offset
+                }
+                Err(error) if sftp_not_found(&error) => 0,
+                Err(error) => return Err(AppError::Ssh(format!("无法检查远程目标：{error}"))),
             }
-            Err(error) if sftp_not_found(&error) => 0,
-            Err(error) => return Err(AppError::Ssh(format!("无法检查远程目标：{error}"))),
+        } else { 0 };
+        if resume_offset > 0 {
+            copy_remote_prefix(sftp, remote, &temporary, resume_offset).await?;
+            input.seek(SeekFrom::Start(resume_offset)).await.map_err(AppError::Io)?;
+            *transferred += resume_offset;
         }
-    } else { 0 };
-    if resume_offset > 0 {
-        copy_remote_prefix(sftp, remote, &temporary, resume_offset).await?;
-        input.seek(SeekFrom::Start(resume_offset)).await.map_err(AppError::Io)?;
-        *transferred += resume_offset;
-    }
-    let mut output = if resume_offset > 0 { sftp.open_with_flags(&temporary, OpenFlags::WRITE).await.map_err(|e| AppError::Ssh(e.to_string()))? } else { sftp.create(&temporary).await.map_err(|e| AppError::Ssh(e.to_string()))? };
-    if resume_offset > 0 { output.seek(SeekFrom::Start(resume_offset)).await.map_err(|e| AppError::Ssh(e.to_string()))?; }
-    let mut buffer = vec![0u8; 64 * 1024]; let mut current = resume_offset; let mut last_emit = Instant::now() - Duration::from_secs(1);
-    loop {
-        if cancelled(cancel) { let _ = output.close().await; let _ = sftp.remove_file(&temporary).await; return Ok(true); }
-        let n = tokio::select! {
-            _ = cancel.changed() => { let _ = output.close().await; let _ = sftp.remove_file(&temporary).await; return Ok(true); }
-            result = input.read(&mut buffer) => result.map_err(AppError::Io)?,
-        };
-        if n == 0 { break; }
-        tokio::select! {
-            _ = cancel.changed() => { let _ = output.close().await; let _ = sftp.remove_file(&temporary).await; return Ok(true); }
-            result = output.write_all(&buffer[..n]) => result.map_err(|e| AppError::Ssh(e.to_string()))?,
+        let mut output = if resume_offset > 0 { sftp.open_with_flags(&temporary, OpenFlags::WRITE).await.map_err(|e| AppError::Ssh(e.to_string()))? } else { sftp.create(&temporary).await.map_err(|e| AppError::Ssh(e.to_string()))? };
+        if resume_offset > 0 { output.seek(SeekFrom::Start(resume_offset)).await.map_err(|e| AppError::Ssh(e.to_string()))?; }
+        let mut buffer = vec![0u8; 64 * 1024]; let mut current = resume_offset; let mut last_emit = Instant::now() - Duration::from_secs(1);
+        loop {
+            let n = input.read(&mut buffer).await.map_err(AppError::Io)?;
+            if n == 0 { break; }
+            output.write_all(&buffer[..n]).await.map_err(|e| AppError::Ssh(e.to_string()))?;
+            current += n as u64; *transferred += n as u64;
+            if last_emit.elapsed() >= Duration::from_millis(120) || current == file_total { last_emit = Instant::now(); let _ = ipc.send(StreamEnvelope { seq: sequence.fetch_add(1, Ordering::Relaxed), timestamp: chrono::Utc::now().to_rfc3339(), host_id: host_id.into(), session_id: None, payload: TransferProgress { transfer_id: transfer_id.into(), host_id: host_id.into(), direction: "upload".into(), current_path: local.display().to_string(), transferred: *transferred, total, status: "running".into(), error: None, file_index, file_count, current_file_transferred: current, current_file_total: file_total } }); }
         }
-        current += n as u64; *transferred += n as u64;
-        if last_emit.elapsed() >= Duration::from_millis(120) || current == file_total { last_emit = Instant::now(); let _ = ipc.send(StreamEnvelope { seq: sequence.fetch_add(1, Ordering::Relaxed), timestamp: chrono::Utc::now().to_rfc3339(), host_id: host_id.into(), session_id: None, payload: TransferProgress { transfer_id: transfer_id.into(), host_id: host_id.into(), direction: "upload".into(), current_path: local.display().to_string(), transferred: *transferred, total, status: "running".into(), error: None, file_index, file_count, current_file_transferred: current, current_file_total: file_total } }); }
-    }
-    output.flush().await.map_err(|e| AppError::Ssh(e.to_string()))?;
-    output.close().await.map_err(|e| AppError::Ssh(e.to_string()))?;
-    if let Err(error) = validate_transfer_size(file_total, current) { let _ = sftp.remove_file(&temporary).await; return Err(error); }
-    replace_remote_file(sftp, &temporary, remote, transfer_id).await?;
-    Ok(false)
+        output.flush().await.map_err(|e| AppError::Ssh(e.to_string()))?;
+        output.close().await.map_err(|e| AppError::Ssh(e.to_string()))?;
+        validate_transfer_size(file_total, current)
+    };
+    store_remote_transfer_file(sftp, &temporary, remote, transfer_id, cancel, prepare).await
 }
 
 #[derive(Debug, Default)]
@@ -1455,9 +1506,8 @@ fn is_link_or_reparse_point(path: &Path) -> AppResult<bool> {
     { Ok(metadata.file_type().is_symlink()) }
 }
 
-async fn copy_local_prefix(source: &Path, destination: &Path, length: u64) -> AppResult<()> {
+async fn copy_local_prefix(source: &Path, output: &mut tokio::fs::File, length: u64) -> AppResult<()> {
     let mut input = tokio::fs::File::open(source).await.map_err(AppError::Io)?;
-    let mut output = tokio::fs::File::create(destination).await.map_err(AppError::Io)?;
     let mut remaining = length;
     let mut buffer = vec![0u8; 64 * 1024];
     while remaining > 0 {
@@ -1499,7 +1549,9 @@ async fn replace_local_file(temporary: &Path, target: &Path, transfer_id: &str) 
         tokio::fs::rename(target, &backup).await.map_err(AppError::Io)?;
     }
     if let Err(error) = tokio::fs::rename(temporary, target).await {
-        if existing { let _ = tokio::fs::rename(&backup, target).await; }
+        if existing && let Err(restore_error) = tokio::fs::rename(&backup, target).await {
+            return Err(AppError::Other(format!("安装目标文件失败：{error}；恢复原文件失败：{restore_error}；原文件备份路径：{}", backup.display())));
+        }
         return Err(AppError::Io(error));
     }
     if existing { let _ = tokio::fs::remove_file(&backup).await; }
@@ -1557,17 +1609,23 @@ fn validate_remote_regular_file(metadata: &russh_sftp::protocol::FileAttributes,
 }
 
 async fn run_download_transfer(manager: &SshManager, host_id: &str, remote_paths: Vec<String>, local_directory: &str, conflict_policy: &str, transfer_id: &str, ipc: IpcChannel<StreamEnvelope<TransferProgress>>, mut cancel: watch::Receiver<bool>) -> AppResult<()> {
+    if cancelled(&cancel) { send_transfer_state(&manager.sequence, &ipc, host_id, transfer_id, "cancelled", None); return Ok(()); }
     let local_root = PathBuf::from(local_directory);
     validate_local_download_path(&local_root, Path::new("."))?;
     let sftp = open_sftp(manager, host_id).await?;
     let mut plan = RemoteDownloadPlan::default();
-    for path in &remote_paths { collect_remote_download(&sftp, path, PathBuf::new(), &mut plan).await?; }
+    for path in &remote_paths {
+        if cancelled(&cancel) { let _ = sftp.close().await; send_transfer_state(&manager.sequence, &ipc, host_id, transfer_id, "cancelled", None); return Ok(()); }
+        collect_remote_download(&sftp, path, PathBuf::new(), &mut plan).await?;
+    }
     let total = plan.files.iter().map(|(_, _, size)| *size).sum::<u64>();
     for directory in &plan.directories {
         validate_local_download_path(&local_root, directory)?;
     }
+    if cancelled(&cancel) { let _ = sftp.close().await; send_transfer_state(&manager.sequence, &ipc, host_id, transfer_id, "cancelled", None); return Ok(()); }
     tokio::fs::create_dir_all(&local_root).await.map_err(AppError::Io)?;
     for directory in &plan.directories {
+        if cancelled(&cancel) { let _ = sftp.close().await; send_transfer_state(&manager.sequence, &ipc, host_id, transfer_id, "cancelled", None); return Ok(()); }
         tokio::fs::create_dir_all(local_root.join(directory)).await.map_err(AppError::Io)?;
     }
     let mut transferred = 0u64;
@@ -1592,34 +1650,34 @@ async fn run_download_transfer(manager: &SshManager, host_id: &str, remote_paths
         }
         if let Some(parent) = local.parent() { tokio::fs::create_dir_all(parent).await.map_err(AppError::Io)?; }
         let part = PathBuf::from(format!("{}.{}.part", local.display(), transfer_id));
-        let mut input = sftp.open(remote_path).await.map_err(|e| AppError::Ssh(e.to_string()))?;
-        let resume_offset = if conflict_policy == "resume" && tokio::fs::try_exists(&local).await.map_err(AppError::Io)? {
-            let existing_len = tokio::fs::metadata(&local).await.map_err(AppError::Io)?.len();
-            if existing_len > *file_total { return Err(AppError::Validation("本地目标比远程源文件更长，不能安全续传".into())); }
-            if existing_len > 0 && !local_prefix_matches(&sftp, remote_path, &local, existing_len).await? { return Err(AppError::Validation("本地目标前缀与远程源文件不一致，已拒绝续传".into())); }
-            existing_len
-        } else { 0 };
-        if resume_offset > 0 { copy_local_prefix(&local, &part, resume_offset).await?; input.seek(SeekFrom::Start(resume_offset)).await.map_err(|e| AppError::Ssh(e.to_string()))?; }
-        let output = if resume_offset > 0 { tokio::fs::OpenOptions::new().write(true).append(true).open(&part).await.map_err(AppError::Io) } else { tokio::fs::File::create(&part).await.map_err(AppError::Io) };
-        let mut output = match output { Ok(v) => v, Err(e) => { let _ = sftp.close().await; return Err(e); } };
-        let mut current = resume_offset; transferred += resume_offset; let mut buffer = vec![0u8; 64 * 1024]; let mut last_emit = Instant::now() - Duration::from_secs(1);
-        loop {
-            if cancelled(&cancel) { output.flush().await.map_err(AppError::Io)?; drop(output); let _ = tokio::fs::remove_file(&part).await; let _ = sftp.close().await; send_transfer_state(&manager.sequence, &ipc, host_id, transfer_id, "cancelled", None); return Ok(()); }
-            let n = tokio::select! {
-                _ = cancel.changed() => { output.flush().await.map_err(AppError::Io)?; drop(output); let _ = tokio::fs::remove_file(&part).await; let _ = sftp.close().await; send_transfer_state(&manager.sequence, &ipc, host_id, transfer_id, "cancelled", None); return Ok(()); }
-                result = input.read(&mut buffer) => result.map_err(|e| AppError::Ssh(e.to_string()))?,
-            };
-            if n == 0 { break; }
-            tokio::select! {
-                _ = cancel.changed() => { output.flush().await.map_err(AppError::Io)?; drop(output); let _ = tokio::fs::remove_file(&part).await; let _ = sftp.close().await; send_transfer_state(&manager.sequence, &ipc, host_id, transfer_id, "cancelled", None); return Ok(()); }
-                result = output.write_all(&buffer[..n]) => result.map_err(AppError::Io)?,
+        // Tokio filesystem creation runs on the blocking pool: dropping its
+        // future does not stop a delayed create. Finish creation before entering
+        // the cancellable section so cleanup can never precede a late create.
+        let output = tokio::fs::File::create(&part).await.map_err(AppError::Io)?;
+        let prepare = async {
+            let mut output = output;
+            let mut input = sftp.open(remote_path).await.map_err(|e| AppError::Ssh(e.to_string()))?;
+            let resume_offset = if conflict_policy == "resume" && tokio::fs::try_exists(&local).await.map_err(AppError::Io)? {
+                let existing_len = tokio::fs::metadata(&local).await.map_err(AppError::Io)?.len();
+                if existing_len > *file_total { return Err(AppError::Validation("本地目标比远程源文件更长，不能安全续传".into())); }
+                if existing_len > 0 && !local_prefix_matches(&sftp, remote_path, &local, existing_len).await? { return Err(AppError::Validation("本地目标前缀与远程源文件不一致，已拒绝续传".into())); }
+                existing_len
+            } else { 0 };
+            if resume_offset > 0 { copy_local_prefix(&local, &mut output, resume_offset).await?; input.seek(SeekFrom::Start(resume_offset)).await.map_err(|e| AppError::Ssh(e.to_string()))?; }
+            let mut current = resume_offset; transferred += resume_offset; let mut buffer = vec![0u8; 64 * 1024]; let mut last_emit = Instant::now() - Duration::from_secs(1);
+            loop {
+                let n = input.read(&mut buffer).await.map_err(|e| AppError::Ssh(e.to_string()))?;
+                if n == 0 { break; }
+                output.write_all(&buffer[..n]).await.map_err(AppError::Io)?;
+                current += n as u64; transferred += n as u64;
+                if last_emit.elapsed() >= Duration::from_millis(120) || current == *file_total { last_emit = Instant::now(); let _ = ipc.send(StreamEnvelope { seq: manager.sequence.fetch_add(1, Ordering::Relaxed), timestamp: chrono::Utc::now().to_rfc3339(), host_id: host_id.into(), session_id: None, payload: TransferProgress { transfer_id: transfer_id.into(), host_id: host_id.into(), direction: "download".into(), current_path: remote_path.clone(), transferred, total, status: "running".into(), error: None, file_index: index as u32 + 1, file_count: plan.files.len() as u32, current_file_transferred: current, current_file_total: *file_total } }); }
             }
-            current += n as u64; transferred += n as u64;
-            if last_emit.elapsed() >= Duration::from_millis(120) || current == *file_total { last_emit = Instant::now(); let _ = ipc.send(StreamEnvelope { seq: manager.sequence.fetch_add(1, Ordering::Relaxed), timestamp: chrono::Utc::now().to_rfc3339(), host_id: host_id.into(), session_id: None, payload: TransferProgress { transfer_id: transfer_id.into(), host_id: host_id.into(), direction: "download".into(), current_path: remote_path.clone(), transferred, total, status: "running".into(), error: None, file_index: index as u32 + 1, file_count: plan.files.len() as u32, current_file_transferred: current, current_file_total: *file_total } }); }
+            output.flush().await.map_err(AppError::Io)?; drop(output);
+            validate_transfer_size(*file_total, current)
+        };
+        if store_local_transfer_file(&part, &local, transfer_id, &mut cancel, prepare).await? {
+            let _ = sftp.close().await; send_transfer_state(&manager.sequence, &ipc, host_id, transfer_id, "cancelled", None); return Ok(());
         }
-        output.flush().await.map_err(AppError::Io)?; drop(output);
-        if let Err(error) = validate_transfer_size(*file_total, current) { let _ = tokio::fs::remove_file(&part).await; return Err(error); }
-        if let Err(error) = replace_local_file(&part, &local, transfer_id).await { let _ = tokio::fs::remove_file(&part).await; return Err(error); }
     }
     let _ = sftp.close().await; send_transfer_state(&manager.sequence, &ipc, host_id, transfer_id, "completed", None); Ok(())
 }

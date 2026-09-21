@@ -10,6 +10,8 @@ const demoHosts: HostProfile[] = [
   { id: "demo-test", name: "测试服务器", hostname: "192.168.56.10", port: 22, username: "dev", groupName: "测试环境", tags: ["debian"], favorite: false, authMethod: "password", jumpHosts: [], status: "disconnected", createdAt: now(), updatedAt: now() },
 ];
 let mockHosts = [...demoHosts];
+let mockSettings = defaultSettings();
+let mockForwardings: ForwardingProfile[] = [];
 const mockMonitorTimers = new Map<string, number>();
 const mockMonitorTaskByHost = new Map<string, string>();
 
@@ -23,7 +25,12 @@ export const api = {
     mockHosts = existing ? mockHosts.map((h) => h.id === host.id ? host : h) : [...mockHosts, host];
     return host;
   },
-  async hostsDelete(id: string) { if (isTauri()) await invoke("hosts_delete", { id }); else mockHosts = mockHosts.filter((h) => h.id !== id); },
+  async hostsDelete(id: string) {
+    if (isTauri()) { await invoke("hosts_delete", { id }); return; }
+    await api.sshDisconnect(id);
+    mockHosts = mockHosts.filter((h) => h.id !== id);
+    mockForwardings = mockForwardings.filter((profile) => profile.hostId !== id);
+  },
   async sshConnect(hostId: string, password?: string) {
     if (isTauri()) return invoke("ssh_connect", { hostId, password });
     await new Promise((r) => setTimeout(r, 500));
@@ -34,6 +41,7 @@ export const api = {
   async sshDisconnect(hostId: string) {
     if (isTauri()) { await invoke("ssh_disconnect", { hostId }); return; }
     mockHosts = mockHosts.map((host) => host.id === hostId ? { ...host, status: "disconnected" } : host);
+    mockForwardings = mockForwardings.map((profile) => profile.hostId === hostId ? { ...profile, active: false, status: "stopped" } : profile);
     const taskId = mockMonitorTaskByHost.get(hostId);
     if (taskId) await api.monitorStop(taskId);
   },
@@ -122,11 +130,31 @@ export const api = {
     const channel = new Channel<StreamEnvelope<TransferProgress>>(); channel.onmessage = onData;
     return invoke("sftp_start_copy", { hostId, sources, destinationDirectory, channel, conflictPolicy: conflictPolicy || null });
   },
-  async settingsGet(): Promise<AppSettings> { return isTauri() ? invoke("settings_get") : defaultSettings(); },
-  async settingsUpdate(settings: AppSettings): Promise<AppSettings> { return isTauri() ? invoke("settings_update", { settings }) : settings; },
-  async settingsReset(): Promise<AppSettings> { return isTauri() ? invoke("settings_reset") : defaultSettings(); },
-  async forwardingList(hostId: string): Promise<ForwardingProfile[]> { return isTauri() ? invoke("forward_list", { hostId }) : []; },
-  async forwardingUpsert(profile: ForwardingProfile): Promise<ForwardingProfile> { return isTauri() ? invoke("forward_upsert", { profile }) : profile; },
-  async forwardingToggle(id: string, active: boolean): Promise<ForwardingProfile | undefined> { return isTauri() ? invoke(active ? "forward_start" : "forward_stop", { id }) : undefined; },
-  async forwardingDelete(id: string) { if (isTauri()) await invoke("forward_delete", { id }); },
+  async settingsGet(): Promise<AppSettings> { return isTauri() ? invoke("settings_get") : structuredClone(mockSettings); },
+  async settingsUpdate(settings: AppSettings): Promise<AppSettings> {
+    if (isTauri()) return invoke("settings_update", { settings });
+    mockSettings = structuredClone(settings); return structuredClone(mockSettings);
+  },
+  async settingsReset(): Promise<AppSettings> {
+    if (isTauri()) return invoke("settings_reset");
+    mockSettings = defaultSettings(); return structuredClone(mockSettings);
+  },
+  async forwardingList(hostId: string): Promise<ForwardingProfile[]> { return isTauri() ? invoke("forward_list", { hostId }) : mockForwardings.filter((profile) => profile.hostId === hostId).map((profile) => ({ ...profile })); },
+  async forwardingUpsert(profile: ForwardingProfile): Promise<ForwardingProfile> {
+    if (isTauri()) return invoke("forward_upsert", { profile });
+    const saved: ForwardingProfile = { ...profile, id: profile.id || crypto.randomUUID(), active: false, status: "stopped" };
+    mockForwardings = [...mockForwardings.filter((item) => item.id !== saved.id), saved]; return { ...saved };
+  },
+  async forwardingToggle(id: string, active: boolean): Promise<ForwardingProfile> {
+    if (isTauri()) return invoke(active ? "forward_start" : "forward_stop", { id });
+    const profile = mockForwardings.find((item) => item.id === id);
+    if (!profile) throw new Error("未找到端口转发配置");
+    if (active && !mockHosts.some((host) => host.id === profile.hostId && host.status === "connected")) throw new Error("请先连接服务器");
+    const updated: ForwardingProfile = { ...profile, active, status: active ? "active" : "stopped", lastError: undefined };
+    mockForwardings = mockForwardings.map((item) => item.id === id ? updated : item); return { ...updated };
+  },
+  async forwardingDelete(id: string) {
+    if (isTauri()) await invoke("forward_delete", { id });
+    else mockForwardings = mockForwardings.filter((profile) => profile.id !== id);
+  },
 };

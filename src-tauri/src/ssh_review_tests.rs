@@ -601,3 +601,239 @@ async fn socks5_parses_ipv6_destination_and_preserves_following_payload() {
     assert_eq!(target, ("2001:db8::1234".into(), 443));
     assert_eq!(&payload, b"data");
 }
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TransferFault { None, Read, Write, Close, Install, Rollback, Cleanup }
+
+struct TransferFaultServer {
+    files: Arc<RwLock<HashMap<String, Vec<u8>>>>,
+    fault: TransferFault,
+}
+
+impl russh_sftp::server::Handler for TransferFaultServer {
+    type Error = russh_sftp::protocol::StatusCode;
+    fn unimplemented(&self) -> Self::Error { Self::Error::OpUnsupported }
+
+    async fn lstat(&mut self, id: u32, path: String) -> Result<russh_sftp::protocol::Attrs, Self::Error> {
+        let files = self.files.read();
+        let data = files.get(&path).ok_or(Self::Error::NoSuchFile)?;
+        Ok(russh_sftp::protocol::Attrs { id, attrs: russh_sftp::protocol::FileAttributes {
+            permissions: Some(0o100644), size: Some(data.len() as u64), ..Default::default()
+        } })
+    }
+
+    async fn open(&mut self, id: u32, filename: String, flags: OpenFlags, _: russh_sftp::protocol::FileAttributes) -> Result<russh_sftp::protocol::Handle, Self::Error> {
+        let mut files = self.files.write();
+        if flags.contains(OpenFlags::CREATE) { files.entry(filename.clone()).or_default(); }
+        let data = files.get_mut(&filename).ok_or(Self::Error::NoSuchFile)?;
+        if flags.contains(OpenFlags::TRUNCATE) { data.clear(); }
+        Ok(russh_sftp::protocol::Handle { id, handle: filename })
+    }
+
+    async fn read(&mut self, id: u32, handle: String, offset: u64, length: u32) -> Result<russh_sftp::protocol::Data, Self::Error> {
+        if self.fault == TransferFault::Read && offset > 0 { return Err(Self::Error::Failure); }
+        let files = self.files.read();
+        let data = files.get(&handle).ok_or(Self::Error::NoSuchFile)?;
+        let start = offset as usize;
+        if start >= data.len() { return Err(Self::Error::Eof); }
+        Ok(russh_sftp::protocol::Data { id, data: data[start..data.len().min(start + length as usize)].to_vec() })
+    }
+
+    async fn write(&mut self, _: u32, handle: String, offset: u64, data: Vec<u8>) -> Result<russh_sftp::protocol::Status, Self::Error> {
+        if self.fault == TransferFault::Write { return Err(Self::Error::Failure); }
+        let mut files = self.files.write();
+        let target = files.get_mut(&handle).ok_or(Self::Error::NoSuchFile)?;
+        let start = offset as usize;
+        target.resize(target.len().max(start + data.len()), 0);
+        target[start..start + data.len()].copy_from_slice(&data);
+        Err(Self::Error::Ok)
+    }
+
+    async fn close(&mut self, _: u32, handle: String) -> Result<russh_sftp::protocol::Status, Self::Error> {
+        Err(if self.fault == TransferFault::Close && handle == "/target.sshopstmp-test" { Self::Error::Failure } else { Self::Error::Ok })
+    }
+
+    async fn remove(&mut self, _: u32, filename: String) -> Result<russh_sftp::protocol::Status, Self::Error> {
+        if self.fault == TransferFault::Cleanup { return Err(Self::Error::PermissionDenied); }
+        Err(if self.files.write().remove(&filename).is_some() { Self::Error::Ok } else { Self::Error::NoSuchFile })
+    }
+
+    async fn rename(&mut self, _: u32, oldpath: String, newpath: String) -> Result<russh_sftp::protocol::Status, Self::Error> {
+        if matches!(self.fault, TransferFault::Install | TransferFault::Rollback) && oldpath == "/target.sshopstmp-test" { return Err(Self::Error::Failure); }
+        if self.fault == TransferFault::Rollback && oldpath == "/target.sshopstmp-backup-test" { return Err(Self::Error::PermissionDenied); }
+        let mut files = self.files.write();
+        if files.contains_key(&newpath) { return Err(Self::Error::Failure); }
+        let data = files.remove(&oldpath).ok_or(Self::Error::NoSuchFile)?;
+        files.insert(newpath, data);
+        Err(Self::Error::Ok)
+    }
+}
+
+async fn transfer_fault_fixture(fault: TransferFault) -> (SftpSession, Arc<RwLock<HashMap<String, Vec<u8>>>>) {
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    let files = Arc::new(RwLock::new(HashMap::from([
+        ("/target".into(), b"original".to_vec()), ("/source".into(), b"new contents".to_vec()),
+    ])));
+    russh_sftp::server::run(server, TransferFaultServer { files: files.clone(), fault }).await;
+    (SftpSession::new(client).await.unwrap(), files)
+}
+
+#[tokio::test]
+async fn upload_failures_clean_temporary_files_and_preserve_original_target() {
+    for fault in [TransferFault::Write, TransferFault::Close, TransferFault::Install] {
+        let (sftp, files) = transfer_fault_fixture(fault).await;
+        let directory = tempfile::tempdir().unwrap();
+        let local = directory.path().join("source");
+        std::fs::write(&local, b"new contents").unwrap();
+        let (_cancel, mut receiver) = watch::channel(false);
+        let mut transferred = 0;
+        let result = timeout(Duration::from_secs(3), upload_file_cancelled(
+            &sftp, &local, "/target", "overwrite", "test-host", "test", 12, &mut transferred,
+            12, 1, 1, &IpcChannel::new(|_| Ok(())), &mut receiver, &Arc::new(AtomicU64::new(1)),
+        )).await.unwrap();
+        assert!(result.is_err());
+        assert_eq!(files.read().get("/target").unwrap(), b"original");
+        assert!(!files.read().keys().any(|path| path.contains("sshopstmp")));
+        sftp.close().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn remote_copy_read_failure_cleans_temporary_file() {
+    let (sftp, files) = transfer_fault_fixture(TransferFault::Read).await;
+    let (_cancel, mut receiver) = watch::channel(false);
+    let prepare = async {
+        let mut input = sftp.open("/source").await.map_err(|error| AppError::Ssh(error.to_string()))?;
+        let mut output = sftp.create("/target.sshopstmp-test").await.map_err(|error| AppError::Ssh(error.to_string()))?;
+        tokio::io::copy(&mut input, &mut output).await.map_err(AppError::Io)?;
+        output.close().await.map_err(AppError::Io)
+    };
+    assert!(store_remote_transfer_file(&sftp, "/target.sshopstmp-test", "/target", "test", &mut receiver, prepare).await.is_err());
+    assert_eq!(files.read().get("/target").unwrap(), b"original");
+    assert!(!files.read().contains_key("/target.sshopstmp-test"));
+    sftp.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn download_read_failure_cleans_partial_file_and_preserves_original() {
+    let (sftp, _) = transfer_fault_fixture(TransferFault::Read).await;
+    let directory = tempfile::tempdir().unwrap();
+    let target = directory.path().join("target");
+    let part = directory.path().join("target.test.part");
+    std::fs::write(&target, b"original").unwrap();
+    let (_cancel, mut receiver) = watch::channel(false);
+    let prepare = async {
+        let mut input = sftp.open("/source").await.map_err(|error| AppError::Ssh(error.to_string()))?;
+        let mut output = tokio::fs::File::create(&part).await.map_err(AppError::Io)?;
+        tokio::io::copy(&mut input, &mut output).await.map_err(AppError::Io)?;
+        output.flush().await.map_err(AppError::Io)
+    };
+    assert!(store_local_transfer_file(&part, &target, "test", &mut receiver, prepare).await.is_err());
+    assert_eq!(std::fs::read(&target).unwrap(), b"original");
+    assert!(!part.exists());
+    sftp.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn cancellation_interrupts_pending_file_work_and_cleans_after_handles_drop() {
+    let directory = tempfile::tempdir().unwrap();
+    let target = directory.path().join("target");
+    let part = directory.path().join("target.test.part");
+    std::fs::write(&target, b"original").unwrap();
+    let (cancel, mut receiver) = watch::channel(false);
+    let prepare = async {
+        let mut output = tokio::fs::File::create(&part).await.map_err(AppError::Io)?;
+        output.write_all(b"partial").await.map_err(AppError::Io)?;
+        output.flush().await.map_err(AppError::Io)?;
+        cancel.send(true).unwrap();
+        std::future::pending::<AppResult<()>>().await
+    };
+    assert!(timeout(Duration::from_secs(3), store_local_transfer_file(&part, &target, "test", &mut receiver, prepare)).await.unwrap().unwrap());
+    assert_eq!(std::fs::read(&target).unwrap(), b"original");
+    assert!(!part.exists());
+}
+
+#[tokio::test]
+async fn cancellation_at_end_of_preparation_never_replaces_remote_or_local_target() {
+    let (sftp, files) = transfer_fault_fixture(TransferFault::None).await;
+    let (cancel, mut receiver) = watch::channel(false);
+    let prepare = async {
+        let mut output = sftp.create("/target.sshopstmp-test").await.map_err(|error| AppError::Ssh(error.to_string()))?;
+        output.write_all(b"new contents").await.map_err(AppError::Io)?;
+        output.close().await.map_err(AppError::Io)?;
+        cancel.send(true).unwrap();
+        Ok(())
+    };
+    assert!(store_remote_transfer_file(&sftp, "/target.sshopstmp-test", "/target", "test", &mut receiver, prepare).await.unwrap());
+    assert_eq!(files.read().get("/target").unwrap(), b"original");
+    assert!(!files.read().contains_key("/target.sshopstmp-test"));
+    sftp.close().await.unwrap();
+
+    let directory = tempfile::tempdir().unwrap();
+    let target = directory.path().join("target");
+    let part = directory.path().join("target.test.part");
+    std::fs::write(&target, b"original").unwrap();
+    let (cancel, mut receiver) = watch::channel(false);
+    let prepare = async {
+        tokio::fs::write(&part, b"new contents").await.map_err(AppError::Io)?;
+        cancel.send(true).unwrap();
+        Ok(())
+    };
+    assert!(store_local_transfer_file(&part, &target, "test", &mut receiver, prepare).await.unwrap());
+    assert_eq!(std::fs::read(&target).unwrap(), b"original");
+    assert!(!part.exists());
+}
+
+#[tokio::test]
+async fn cleanup_failure_reports_the_remaining_remote_temporary_path() {
+    let (sftp, files) = transfer_fault_fixture(TransferFault::Cleanup).await;
+    let (_cancel, mut receiver) = watch::channel(false);
+    let prepare = async {
+        let output = sftp.create("/target.sshopstmp-test").await.map_err(|error| AppError::Ssh(error.to_string()))?;
+        output.close().await.map_err(AppError::Io)?;
+        Err(AppError::Other("injected read failure".into()))
+    };
+    let error = store_remote_transfer_file(&sftp, "/target.sshopstmp-test", "/target", "test", &mut receiver, prepare).await.unwrap_err();
+    assert!(error.to_string().contains("injected read failure"));
+    assert!(error.to_string().contains("/target.sshopstmp-test"));
+    assert_eq!(files.read().get("/target").unwrap(), b"original");
+    assert!(files.read().contains_key("/target.sshopstmp-test"));
+    sftp.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn failed_remote_rollback_reports_and_retains_the_original_backup() {
+    let (sftp, files) = transfer_fault_fixture(TransferFault::Rollback).await;
+    let (_cancel, mut receiver) = watch::channel(false);
+    let prepare = async {
+        let mut output = sftp.create("/target.sshopstmp-test").await.map_err(|error| AppError::Ssh(error.to_string()))?;
+        output.write_all(b"new contents").await.map_err(AppError::Io)?;
+        output.close().await.map_err(AppError::Io)
+    };
+    let error = store_remote_transfer_file(&sftp, "/target.sshopstmp-test", "/target", "test", &mut receiver, prepare).await.unwrap_err();
+    assert!(error.to_string().contains("恢复原文件失败"));
+    assert!(error.to_string().contains("/target.sshopstmp-backup-test"));
+    assert_eq!(files.read().get("/target.sshopstmp-backup-test").unwrap(), b"original");
+    assert!(!files.read().contains_key("/target"));
+    assert!(!files.read().contains_key("/target.sshopstmp-test"));
+    sftp.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn cancellation_after_local_creation_drops_unpolled_handle_before_cleanup() {
+    let directory = tempfile::tempdir().unwrap();
+    let target = directory.path().join("target");
+    let part = directory.path().join("target.test.part");
+    std::fs::write(&target, b"original").unwrap();
+    let output = tokio::fs::File::create(&part).await.unwrap();
+    let (cancel, mut receiver) = watch::channel(false);
+    cancel.send(true).unwrap();
+    let prepare = async {
+        let _output = output;
+        panic!("already-cancelled preparation must not run");
+        #[allow(unreachable_code)] Ok(())
+    };
+    assert!(store_local_transfer_file(&part, &target, "test", &mut receiver, prepare).await.unwrap());
+    assert!(!part.exists());
+    assert_eq!(std::fs::read(target).unwrap(), b"original");
+}

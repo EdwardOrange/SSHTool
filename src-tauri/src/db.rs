@@ -194,6 +194,15 @@ impl Database {
         self.0.lock().execute("INSERT INTO settings(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value", params![key, value])?;
         Ok(())
     }
+    pub fn setting_set_if_unchanged(&self, key: &str, previous: Option<&str>, value: &str) -> AppResult<bool> {
+        let connection = self.0.lock();
+        let changed = if let Some(previous) = previous {
+            connection.execute("UPDATE settings SET value=?3 WHERE key=?1 AND value=?2", params![key, previous, value])?
+        } else {
+            connection.execute("INSERT INTO settings(key,value) VALUES(?1,?2) ON CONFLICT(key) DO NOTHING", params![key, value])?
+        };
+        Ok(changed != 0)
+    }
     pub fn metric_add(&self, metric: &MetricSnapshot, resolution: u32) -> AppResult<()> {
         if !matches!(resolution, 2 | 5 | 10 | 30) {
             return Err(AppError::Validation("监控采样间隔无效".into()));
@@ -283,6 +292,30 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn settings_migration_cannot_overwrite_a_save_after_its_read() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = Database::open(&directory.path().join("test.db")).unwrap();
+        database.setting_set("app", "legacy").unwrap();
+        let read_by_migration = database.setting_get("app").unwrap();
+        database.setting_set("app", "new user preferences").unwrap();
+        assert!(!database.setting_set_if_unchanged("app", read_by_migration.as_deref(), "migrated legacy").unwrap());
+        assert_eq!(database.setting_get("app").unwrap().as_deref(), Some("new user preferences"));
+        assert!(database.setting_set_if_unchanged("app", Some("new user preferences"), "normalized preferences").unwrap());
+        assert_eq!(database.setting_get("app").unwrap().as_deref(), Some("normalized preferences"));
+    }
+
+    #[test]
+    fn first_settings_read_cannot_replace_concurrently_created_preferences() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = Database::open(&directory.path().join("test.db")).unwrap();
+        assert_eq!(database.setting_get("app").unwrap(), None);
+        database.setting_set("app", "saved before initialization").unwrap();
+        assert!(!database.setting_set_if_unchanged("app", None, "defaults").unwrap());
+        assert_eq!(database.setting_get("app").unwrap().as_deref(), Some("saved before initialization"));
+        assert!(database.setting_set_if_unchanged("another-setting", None, "defaults").unwrap());
+    }
 
     fn metric_at(timestamp: chrono::DateTime<chrono::Utc>, cpu_percent: f64) -> MetricSnapshot {
         MetricSnapshot {

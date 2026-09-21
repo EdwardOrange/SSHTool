@@ -88,6 +88,14 @@ impl FirewallManager {
         self.plans.read().get(plan_id).map(|stored| stored.plan.host_id.clone())
     }
 
+    pub fn discard_host_plans(&self, host_id: &str) {
+        // The caller holds the host operation lock shared by firewall IPC,
+        // edits and deletion. A host ID may be reused for a different endpoint;
+        // matching rule hashes do not make an old plan safe for that server.
+        // Already scheduled remote rollback remains independent of this map.
+        self.plans.write().retain(|_, stored| stored.plan.host_id != host_id);
+    }
+
     #[cfg(test)]
     pub async fn read(&self, ssh: &SshManager, host_id: &str) -> AppResult<FirewallState> {
         self.read_with_password(ssh, host_id, None).await
@@ -975,6 +983,56 @@ fn log(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn pending_plan(host_id: &str) -> StoredPlan {
+        StoredPlan {
+            plan: FirewallPlan { id: format!("plan-{host_id}"), host_id: host_id.into(), state_hash: "same-rules-on-two-servers".into(),
+                summary: String::new(), commands: vec!["must not execute".into()], warnings: vec![], risk: "medium".into(),
+                rollback_available: true, expires_at: (chrono::Utc::now() + chrono::Duration::minutes(5)).to_rfc3339() },
+            backend: "ufw".into(), scheduler: "systemd".into(), applied: false,
+            rollback_unit: None, rollback_deadline: None, rollback_restore: None, persist_command: None, busy: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn editing_connection_identity_discards_only_that_hosts_firewall_plans() {
+        let (_directory, state) = crate::command_review_tests::fixture();
+        let host = crate::save_host(&state, crate::command_review_tests::draft()).await.unwrap();
+        let plan = pending_plan(&host.id);
+        let plan_id = plan.plan.id.clone();
+        state.firewall.plans.write().insert(plan_id.clone(), plan);
+        let unrelated = pending_plan("other-host");
+        let unrelated_id = unrelated.plan.id.clone();
+        state.firewall.plans.write().insert(unrelated_id.clone(), unrelated);
+
+        let mut edit = crate::command_review_tests::draft();
+        edit.id = Some(host.id.clone());
+        edit.name = "Cosmetic edit".into();
+        crate::save_host(&state, edit.clone()).await.unwrap();
+        assert_eq!(state.firewall.plan_host(&plan_id).as_deref(), Some(host.id.as_str()));
+
+        edit.hostname = "different-server.invalid".into();
+        crate::save_host(&state, edit).await.unwrap();
+        assert!(matches!(state.firewall.apply(&state.ssh, &state.db, &plan_id, None).await, Err(AppError::NotFound(_))));
+        assert_eq!(state.firewall.plan_host(&unrelated_id).as_deref(), Some("other-host"));
+    }
+
+    #[tokio::test]
+    async fn deleting_a_host_discards_prepared_and_applied_firewall_plans() {
+        let (_directory, state) = crate::command_review_tests::fixture();
+        let host = crate::save_host(&state, crate::command_review_tests::draft()).await.unwrap();
+        let plan = pending_plan(&host.id);
+        let plan_id = plan.plan.id.clone();
+        state.firewall.plans.write().insert(plan_id.clone(), plan.clone());
+        let mut applied = plan;
+        applied.applied = true;
+        applied.plan.id.push_str("-applied");
+        let applied_id = applied.plan.id.clone();
+        state.firewall.plans.write().insert(applied_id.clone(), applied);
+        crate::delete_host(&state, &host.id).await.unwrap();
+        assert!(matches!(state.firewall.commit(&state.ssh, &applied_id, None).await, Err(AppError::NotFound(_))));
+        assert!(matches!(state.firewall.rollback(&state.ssh, &plan_id, None).await, Err(AppError::NotFound(_))));
+    }
     fn rule() -> FirewallRuleInput {
         FirewallRuleInput {
             id: Some("x".into()),

@@ -19,6 +19,7 @@ use firewall::FirewallManager;
 use models::*;
 use monitor::MonitorManager;
 use parking_lot::Mutex;
+use sha2::{Digest, Sha256};
 use ssh::{SshManager, TerminalAuditEvent, TerminalAuditEventKind};
 use std::{
     collections::HashMap,
@@ -155,10 +156,12 @@ async fn save_host(state: &AppState, mut draft: HostDraft) -> AppResult<HostProf
     let now = Utc::now().to_rfc3339();
     let existing = if is_update { Some(state.db.host_get(&id)?) } else { None };
     let endpoint_changed = existing.as_ref().is_some_and(|host| host.hostname != draft.hostname.trim() || host.port != draft.port);
-    if existing.as_ref().is_some_and(|host| connection_settings_changed(host, &draft)) && state.ssh.is_connected(&id) {
+    let connection_changed = existing.as_ref().is_some_and(|host| connection_settings_changed(host, &draft));
+    if connection_changed && state.ssh.is_connected(&id) {
         return Err(AppError::Validation("修改已连接服务器的地址、认证或跳板配置前请先断开连接".into()));
     }
     let old_credential_id = existing.as_ref().and_then(|host| host.credential_id.clone());
+    let old_sudo_credential_id = existing.as_ref().filter(|host| authentication_identity_changed(host, &draft)).map(sudo_credential_id);
     let mut credential_id = retained_credential_id(existing.as_ref(), &draft);
     let mut new_credential_id = None;
     if matches!(draft.auth_method.as_str(), "password" | "key")
@@ -202,6 +205,11 @@ async fn save_host(state: &AppState, mut draft: HostDraft) -> AppResult<HostProf
         if let Some(cid) = new_credential_id { let _ = security::delete_secret(&cid); }
         return Err(error);
     }
+    if connection_changed { state.firewall.discard_host_plans(&id); }
+    if let Some(old) = old_sudo_credential_id {
+        let _ = security::delete_secret(&old);
+        let _ = security::delete_secret(&format!("sudo:{id}"));
+    }
     if old_credential_id.as_deref() != host.credential_id.as_deref()
         && let Some(old) = old_credential_id
     {
@@ -213,6 +221,7 @@ async fn save_host(state: &AppState, mut draft: HostDraft) -> AppResult<HostProf
 fn retained_credential_id(existing: Option<&HostProfile>, draft: &HostDraft) -> Option<String> {
     let existing = existing?;
     if draft.remember_password == Some(false)
+        || authentication_identity_changed(existing, draft)
         || !matches!(draft.auth_method.as_str(), "password" | "key")
         || draft.auth_method != existing.auth_method
         || (draft.auth_method == "key" && draft.private_key_path != existing.private_key_path)
@@ -220,6 +229,18 @@ fn retained_credential_id(existing: Option<&HostProfile>, draft: &HostDraft) -> 
         return None;
     }
     existing.credential_id.clone()
+}
+
+fn authentication_identity_changed(host: &HostProfile, draft: &HostDraft) -> bool {
+    host.hostname != draft.hostname.trim() || host.port != draft.port || host.username != draft.username.trim()
+}
+
+fn sudo_credential_id(host: &HostProfile) -> String {
+    // Length-prefix string fields so distinct endpoints cannot collide by
+    // including separators in their names. Legacy host-ID-only credentials
+    // have no identity binding and must be entered again once.
+    let identity = format!("{}:{}:{}:{}:{}", host.hostname.len(), host.hostname, host.port, host.username.len(), host.username);
+    format!("sudo:{}:{}", host.id, hex::encode(Sha256::digest(identity.as_bytes())))
 }
 
 fn connection_settings_changed(host: &HostProfile, draft: &HostDraft) -> bool {
@@ -245,10 +266,14 @@ async fn delete_host(state: &AppState, id: &str) -> AppResult<()> {
     if let Ok(profiles) = state.db.forward_list(id) {
         for profile in profiles { let _ = state.ssh.forward_stop(&profile.id).await; }
     }
-    let credential_id = state.db.host_get(id).ok().and_then(|host| host.credential_id);
+    let host = state.db.host_get(id).ok();
+    let sudo_credential_id = host.as_ref().map(sudo_credential_id);
+    let credential_id = host.and_then(|host| host.credential_id);
     let _ = state.ssh.disconnect_inner(id).await;
     state.db.host_delete(id)?;
+    state.firewall.discard_host_plans(id);
     if let Some(cid) = credential_id { let _ = security::delete_secret(&cid); }
+    if let Some(cid) = sudo_credential_id { let _ = security::delete_secret(&cid); }
     let _ = security::delete_secret(&format!("sudo:{id}"));
     Ok(())
 }
@@ -421,10 +446,13 @@ async fn firewall_read(
     state: State<'_, AppState>, host_id: String,
     sudo_password: Option<String>, remember_sudo: Option<bool>,
 ) -> AppResult<FirewallState> {
-    let password = sudo_password.or_else(|| security::read_secret(&format!("sudo:{host_id}")).ok());
+    let operation = state.host_operation(&host_id);
+    let _guard = operation.lock().await;
+    let credential_id = sudo_credential_id(&state.db.host_get(&host_id)?);
+    let password = sudo_password.or_else(|| security::read_secret(&credential_id).ok());
     let result = state.firewall.read_with_password(&state.ssh, &host_id, password.as_deref()).await?;
     if remember_sudo.unwrap_or(false) && let Some(password) = password.as_deref() {
-        security::store_secret(&format!("sudo:{host_id}"), password)?;
+        security::store_secret(&credential_id, password)?;
     }
     Ok(result)
 }
@@ -436,10 +464,13 @@ async fn firewall_plan(
     sudo_password: Option<String>,
     remember_sudo: Option<bool>,
 ) -> AppResult<FirewallPlan> {
-    let password = sudo_password.or_else(|| security::read_secret(&format!("sudo:{host_id}")).ok());
+    let operation = state.host_operation(&host_id);
+    let _guard = operation.lock().await;
+    let credential_id = sudo_credential_id(&state.db.host_get(&host_id)?);
+    let password = sudo_password.or_else(|| security::read_secret(&credential_id).ok());
     let result = state.firewall.plan_with_password(&state.ssh, &host_id, change, password.as_deref()).await?;
     if remember_sudo.unwrap_or(false) && let Some(password) = password.as_deref() {
-        security::store_secret(&format!("sudo:{host_id}"), password)?;
+        security::store_secret(&credential_id, password)?;
     }
     Ok(result)
 }
@@ -450,29 +481,37 @@ async fn firewall_apply(
     sudo_password: Option<String>,
     remember_sudo: Option<bool>,
 ) -> AppResult<FirewallApplyResult> {
-    let host_id = state.firewall.plan_host(&plan_id);
-    let remembered = if sudo_password.is_none() { host_id.as_deref().and_then(|id| security::read_secret(&format!("sudo:{id}")).ok()) } else { None };
+    let host_id = state.firewall.plan_host(&plan_id).ok_or_else(|| AppError::NotFound("防火墙计划".into()))?;
+    let operation = state.host_operation(&host_id);
+    let _guard = operation.lock().await;
+    let credential_id = sudo_credential_id(&state.db.host_get(&host_id)?);
+    let remembered = if sudo_password.is_none() { security::read_secret(&credential_id).ok() } else { None };
     let effective_password = sudo_password.or(remembered);
     let result = state.firewall.apply(&state.ssh, &state.db, &plan_id, effective_password.as_deref()).await;
     if result.is_ok() && remember_sudo.unwrap_or(false)
         && let Some(password) = effective_password.as_deref()
-        && let Some(host_id) = host_id
     {
-        let _ = security::store_secret(&format!("sudo:{host_id}"), password);
+        let _ = security::store_secret(&credential_id, password);
     }
     result
 }
 #[tauri::command]
 async fn firewall_commit(state: State<'_, AppState>, plan_id: String, sudo_password: Option<String>) -> AppResult<()> {
-    let host_id = state.firewall.plan_host(&plan_id);
-    let remembered = if sudo_password.is_none() { host_id.as_deref().and_then(|id| security::read_secret(&format!("sudo:{id}")).ok()) } else { None };
+    let host_id = state.firewall.plan_host(&plan_id).ok_or_else(|| AppError::NotFound("防火墙计划".into()))?;
+    let operation = state.host_operation(&host_id);
+    let _guard = operation.lock().await;
+    let credential_id = sudo_credential_id(&state.db.host_get(&host_id)?);
+    let remembered = if sudo_password.is_none() { security::read_secret(&credential_id).ok() } else { None };
     let effective_password = sudo_password.or(remembered);
     state.firewall.commit(&state.ssh, &plan_id, effective_password.as_deref()).await
 }
 #[tauri::command]
 async fn firewall_rollback(state: State<'_, AppState>, plan_id: String, sudo_password: Option<String>) -> AppResult<()> {
-    let host_id = state.firewall.plan_host(&plan_id);
-    let remembered = if sudo_password.is_none() { host_id.as_deref().and_then(|id| security::read_secret(&format!("sudo:{id}")).ok()) } else { None };
+    let host_id = state.firewall.plan_host(&plan_id).ok_or_else(|| AppError::NotFound("防火墙计划".into()))?;
+    let operation = state.host_operation(&host_id);
+    let _guard = operation.lock().await;
+    let credential_id = sudo_credential_id(&state.db.host_get(&host_id)?);
+    let remembered = if sudo_password.is_none() { security::read_secret(&credential_id).ok() } else { None };
     let effective_password = sudo_password.or(remembered);
     state.firewall.rollback(&state.ssh, &plan_id, effective_password.as_deref()).await
 }
@@ -559,16 +598,19 @@ fn normalize_settings(mut settings: AppSettings) -> AppSettings {
 
 #[tauri::command]
 fn settings_get(state: State<'_, AppState>) -> AppResult<AppSettings> {
-    let stored = state.db.setting_get("app")?;
-    let settings = stored.as_deref().and_then(|value| serde_json::from_str(value).ok()).unwrap_or_else(default_settings);
-    let normalized = normalize_settings(settings);
-    // Persist migrations and trimmed rule fields so the same legacy value is not
-    // reinterpreted on every startup.
-    let serialized = serde_json::to_string(&normalized).map_err(|e| AppError::Other(e.to_string()))?;
-    if stored.as_deref() != Some(serialized.as_str()) {
-        state.db.setting_set("app", &serialized)?;
+    loop {
+        let stored = state.db.setting_get("app")?;
+        let settings = stored.as_deref().and_then(|value| serde_json::from_str(value).ok()).unwrap_or_else(default_settings);
+        let normalized = normalize_settings(settings);
+        // A read may overlap a settings save on another IPC worker. Migrate
+        // only the exact version read; otherwise load the newly saved value.
+        let serialized = serde_json::to_string(&normalized).map_err(|e| AppError::Other(e.to_string()))?;
+        if stored.as_deref() == Some(serialized.as_str())
+            || state.db.setting_set_if_unchanged("app", stored.as_deref(), &serialized)?
+        {
+            return Ok(normalized);
+        }
     }
-    Ok(normalized)
 }
 
 #[tauri::command]

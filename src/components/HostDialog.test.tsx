@@ -62,4 +62,28 @@ describe("host editing", () => {
     fireEvent.click(screen.getByRole("button", { name: "save" }));
     await waitFor(() => expect(mocks.hostsUpsert).toHaveBeenCalledWith(expect.objectContaining({ tags: ["first", "second"] })));
   });
+
+  it.each([
+    { label: "host", value: "different.example.test" },
+    { label: "port", value: "2222" },
+    { label: "username", value: "other-user" },
+  ])("clears credentials when the connection $label changes", async ({ label, value }) => {
+    render(<HostDialog open initialHost={{ ...host, authMethod: "password", credentialId: "saved-password" }} onClose={vi.fn()}/>);
+    fireEvent.change(screen.getByLabelText("SSH 密码"), { target: { value: "old-secret" } });
+    fireEvent.change(screen.getByLabelText(label), { target: { value } });
+    expect((screen.getByLabelText("SSH 密码") as HTMLInputElement).value).toBe("");
+    expect((screen.getByRole("switch", { name: "安全保存到 Windows Credential Manager" }) as HTMLInputElement).checked).toBe(false);
+    expect(screen.getByText(/连接身份已更改/)).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "save" }));
+    await waitFor(() => expect(mocks.hostsUpsert).toHaveBeenCalledWith(expect.objectContaining({ password: undefined, credentialId: undefined, rememberPassword: false })));
+  });
+
+  it("does not restore old credentials after changing the destination back", async () => {
+    render(<HostDialog open initialHost={{ ...host, authMethod: "key", privateKeyPath: "C:\\keys\\key", credentialId: "old-passphrase" }} onClose={vi.fn()}/>);
+    fireEvent.change(screen.getByLabelText("host"), { target: { value: "other.example.test" } });
+    fireEvent.change(screen.getByLabelText("host"), { target: { value: host.hostname } });
+    expect(screen.queryByText("留空保留已保存的口令；取消安全保存可移除。")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "save" }));
+    await waitFor(() => expect(mocks.hostsUpsert).toHaveBeenCalledWith(expect.objectContaining({ hostname: host.hostname, credentialId: undefined, rememberPassword: false })));
+  });
 });
